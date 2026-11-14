@@ -1,0 +1,278 @@
+-- Services
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
+
+-- Local Player
+local localPlayer = Players.LocalPlayer
+local playerGui = localPlayer:WaitForChild("PlayerGui")
+
+-- Safe Remote Resolver
+local function resolveRemote(remoteName: string)
+    local success, remote = pcall(function()
+        return ReplicatedStorage
+            :WaitForChild("NKSystem", 5)
+            :WaitForChild("Packages", 5)
+            :WaitForChild("Knit", 5)
+            :WaitForChild("Services", 5)
+            :WaitForChild("TanamService", 5)
+            :WaitForChild("RF", 5)
+            :WaitForChild(remoteName, 5)
+    end)
+    return if success then remote else nil
+end
+
+local beliBibitRF = resolveRemote("BeliBibit")
+local tanamRF = resolveRemote("Tanam")
+
+if not beliBibitRF or not tanamRF then
+    warn("[AutoFarm]: Gagal mendeteksi RemoteFunction Knit Service.")
+    return
+end
+
+-- Configuration
+local CONFIG = {
+    CROP_NAME = "Cabai",
+    BUY_COUNT = 100,
+    INTER_ACTION_DELAY = 0.35,
+    CYCLE_COOLDOWN = 0.10
+}
+
+local PLOT_COORDINATES = {
+     Vector3.new(-408.9349060058594, 15.5, -252.46971130371094),
+     Vector3.new(-397.1911315917969, 15.5, -249.8361358642578),
+     Vector3.new(-382.33148193359375, 15.5, -242.9317626953125),
+     Vector3.new(-370.10791015625, 15.5, -239.33607482910156),
+
+}
+
+-- State Management
+local isRunning = false
+local farmThread = nil
+
+-- UI Dimensions
+local NORMAL_SIZE = UDim2.new(0, 240, 0, 150)
+local MINIMIZED_SIZE = UDim2.new(0, 240, 0, 32)
+local MAXIMIZED_SIZE = UDim2.new(0, 300, 0, 180)
+
+local TWEEN_FAST = TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+
+-- ==========================================
+-- UI CONSTRUCTION
+-- ==========================================
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "ModernFarmWindow"
+screenGui.ResetOnSpawn = false
+screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+screenGui.Parent = playerGui
+
+local mainFrame = Instance.new("Frame")
+mainFrame.Name = "MainFrame"
+mainFrame.Size = NORMAL_SIZE
+mainFrame.Position = UDim2.new(0.5, -120, 0.15, 0)
+mainFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 24)
+mainFrame.BorderSizePixel = 0
+mainFrame.ClipsDescendants = true
+mainFrame.Active = true
+mainFrame.Draggable = true
+mainFrame.Parent = screenGui
+
+local frameCorner = Instance.new("UICorner")
+frameCorner.CornerRadius = UDim.new(0, 10)
+frameCorner.Parent = mainFrame
+
+local frameStroke = Instance.new("UIStroke")
+frameStroke.Color = Color3.fromRGB(50, 50, 58)
+frameStroke.Thickness = 1.2
+frameStroke.Parent = mainFrame
+
+-- Title Bar (Header)
+local titleBar = Instance.new("Frame")
+titleBar.Name = "TitleBar"
+titleBar.Size = UDim2.new(1, 0, 0, 32)
+titleBar.BackgroundColor3 = Color3.fromRGB(28, 28, 34)
+titleBar.BorderSizePixel = 0
+titleBar.Parent = mainFrame
+
+local titleCorner = Instance.new("UICorner")
+titleCorner.CornerRadius = UDim.new(0, 10)
+titleCorner.Parent = titleBar
+
+-- Title Text
+local titleText = Instance.new("TextLabel")
+titleText.Size = UDim2.new(1, -95, 1, 0)
+titleText.Position = UDim2.new(0, 12, 0, 0)
+titleText.BackgroundTransparency = 1
+titleText.Font = Enum.Font.GothamBold
+titleText.Text = "AUTO-FARM PANEL"
+titleText.TextColor3 = Color3.fromRGB(220, 220, 230)
+titleText.TextSize = 10
+titleText.TextXAlignment = Enum.TextXAlignment.Left
+titleText.Parent = titleBar
+
+-- Window Controls Container
+local controlsContainer = Instance.new("Frame")
+controlsContainer.Name = "WindowControls"
+controlsContainer.Size = UDim2.new(0, 85, 1, 0)
+controlsContainer.Position = UDim2.new(1, -85, 0, 0)
+controlsContainer.BackgroundTransparency = 1
+controlsContainer.Parent = titleBar
+
+local controlsLayout = Instance.new("UIListLayout")
+controlsLayout.FillDirection = Enum.FillDirection.Horizontal
+controlsLayout.HorizontalAlignment = Enum.HorizontalAlignment.Right
+controlsLayout.VerticalAlignment = Enum.VerticalAlignment.Center
+controlsLayout.Padding = UDim.new(0, 2)
+controlsLayout.Parent = controlsContainer
+
+local function createControlButton(symbol: string, hoverColor: Color3)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(0, 26, 0, 24)
+    btn.BackgroundTransparency = 1
+    btn.Font = Enum.Font.Gotham
+    btn.Text = symbol
+    btn.TextColor3 = Color3.fromRGB(160, 160, 175)
+    btn.TextSize = 11
+    btn.AutoButtonColor = false
+    btn.Parent = controlsContainer
+
+    local btnCorner = Instance.new("UICorner")
+    btnCorner.CornerRadius = UDim.new(0, 4)
+    btnCorner.Parent = btn
+
+    btn.MouseEnter:Connect(function()
+        TweenService:Create(btn, TWEEN_FAST, { BackgroundTransparency = 0, BackgroundColor3 = hoverColor }):Play()
+        btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    end)
+
+    btn.MouseLeave:Connect(function()
+        TweenService:Create(btn, TWEEN_FAST, { BackgroundTransparency = 1 }):Play()
+        btn.TextColor3 = Color3.fromRGB(160, 160, 175)
+    end)
+
+    return btn
+end
+
+local btnMinimize = createControlButton("—", Color3.fromRGB(45, 45, 55))
+local btnMaximize = createControlButton("▢", Color3.fromRGB(45, 45, 55))
+local btnClose    = createControlButton("✕", Color3.fromRGB(220, 40, 50))
+
+-- Body Content Container
+local bodyFrame = Instance.new("Frame")
+bodyFrame.Name = "Body"
+bodyFrame.Size = UDim2.new(1, -24, 1, -44)
+bodyFrame.Position = UDim2.new(0, 12, 0, 38)
+bodyFrame.BackgroundTransparency = 1
+bodyFrame.Parent = mainFrame
+
+local infoLabel = Instance.new("TextLabel")
+infoLabel.Size = UDim2.new(1, 0, 0, 20)
+infoLabel.BackgroundTransparency = 1
+infoLabel.Font = Enum.Font.Gotham
+infoLabel.Text = "Target: " .. CONFIG.CROP_NAME .. " (" .. #PLOT_COORDINATES .. " Plots)"
+infoLabel.TextColor3 = Color3.fromRGB(140, 140, 150)
+infoLabel.TextSize = 11
+infoLabel.TextXAlignment = Enum.TextXAlignment.Left
+infoLabel.Parent = bodyFrame
+
+local toggleButton = Instance.new("TextButton")
+toggleButton.Name = "ToggleButton"
+toggleButton.Size = UDim2.new(1, 0, 0, 40)
+toggleButton.Position = UDim2.new(0, 0, 1, -44)
+toggleButton.BackgroundColor3 = Color3.fromRGB(225, 29, 72)
+toggleButton.AutoButtonColor = false
+toggleButton.Font = Enum.Font.GothamBold
+toggleButton.Text = "START AUTOMATION"
+toggleButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+toggleButton.TextSize = 11
+toggleButton.Parent = bodyFrame
+
+local btnTogCorner = Instance.new("UICorner")
+btnTogCorner.CornerRadius = UDim.new(0, 8)
+btnTogCorner.Parent = toggleButton
+
+-- ==========================================
+-- LOGIC & HANDLERS
+-- ==========================================
+local isMinimized = false
+local isMaximized = false
+
+-- Window Actions
+btnMinimize.MouseButton1Click:Connect(function()
+    isMinimized = not isMinimized
+    local targetSize = isMinimized and MINIMIZED_SIZE or (if isMaximized then MAXIMIZED_SIZE else NORMAL_SIZE)
+    TweenService:Create(mainFrame, TWEEN_FAST, { Size = targetSize }):Play()
+end)
+
+btnMaximize.MouseButton1Click:Connect(function()
+    if isMinimized then isMinimized = false end
+    isMaximized = not isMaximized
+    local targetSize = isMaximized and MAXIMIZED_SIZE or NORMAL_SIZE
+    TweenService:Create(mainFrame, TWEEN_FAST, { Size = targetSize }):Play()
+end)
+
+local function stopFarmingLoop()
+    isRunning = false
+    if farmThread then
+        task.cancel(farmThread)
+        farmThread = nil
+    end
+end
+
+btnClose.MouseButton1Click:Connect(function()
+    stopFarmingLoop()
+    screenGui:Destroy()
+end)
+
+-- Farming Loop Implementation
+local function executeFarmingCycle()
+    local buySuccess, buyErr = pcall(function()
+        return beliBibitRF:InvokeServer(CONFIG.CROP_NAME, CONFIG.BUY_COUNT)
+    end)
+
+    if not buySuccess then
+        warn("[AutoFarm Error]: Beli gagal:", buyErr)
+    end
+
+    task.wait(CONFIG.INTER_ACTION_DELAY)
+
+    for index, plotPos in ipairs(PLOT_COORDINATES) do
+        if not isRunning then break end
+
+        local plantSuccess, plantErr = pcall(function()
+            return tanamRF:InvokeServer(CONFIG.CROP_NAME, plotPos)
+        end)
+
+        if not plantSuccess then
+            warn(string.format("[AutoFarm Error]: Plot #%d gagal: %s", index, tostring(plantErr)))
+        end
+
+        task.wait(CONFIG.INTER_ACTION_DELAY)
+    end
+end
+
+local function startFarmingLoop()
+    farmThread = task.spawn(function()
+        while isRunning do
+            executeFarmingCycle()
+            task.wait(CONFIG.CYCLE_COOLDOWN)
+        end
+    end)
+end
+
+-- Toggle Button Logic
+toggleButton.MouseButton1Click:Connect(function()
+    isRunning = not isRunning
+    
+    local targetColor = if isRunning then Color3.fromRGB(16, 185, 129) else Color3.fromRGB(225, 29, 72)
+    local targetText = if isRunning then "ACTIVE (RUNNING)" else "START AUTOMATION"
+
+    TweenService:Create(toggleButton, TWEEN_FAST, { BackgroundColor3 = targetColor }):Play()
+    toggleButton.Text = targetText
+
+    if isRunning then
+        startFarmingLoop()
+    else
+        stopFarmingLoop()
+    end
+end)
