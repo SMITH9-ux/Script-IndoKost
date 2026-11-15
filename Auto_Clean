@@ -1,10 +1,3 @@
---[[
-    ====================================================================
-    AUTO CLEANER (CONFIGURABLE PARAMETERS VIA UI)
-    Platform: Luau / Client-Side Script
-    ====================================================================
-]]
-
 -- SERVICES
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
@@ -15,18 +8,22 @@ local CoreGui = game:GetService("CoreGui")
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
--- CONFIGURATION & STATE
+-- CONFIG & STATE
 local Config = {
     TargetName = "kotoran",
     TargetMaterial = Enum.Material.Plastic,
     DefaultKosanID = "8833771934_19",
-    DefaultRadius = 10000,
-    DefaultLoop = 0.4,
-    MinLoopInterval = 0.10 -- Batas aman untuk mencegah crash/freeze
+    DefaultRadius = 50,
+    DefaultLoop = 0.5,
+    MinLoopInterval = 0.05,
+    FullHeight = 275,
+    MiniHeight = 36
 }
 
 local State = {
+    IsRunning = true,
     IsEnabled = false,
+    IsMinimized = false,
     CurrentKosanID = Config.DefaultKosanID,
     KosanOwner = "",
     RoomNumber = "",
@@ -34,78 +31,68 @@ local State = {
     LoopInterval = Config.DefaultLoop
 }
 
--- PARSER: Memisahkan ID Kosan ("8833771934_19" -> Owner ID & Room Number)
+local Connections = {}
+
 local function parseKosanID(idString)
     local parts = string.split(tostring(idString), "_")
-    return parts[1] or "", parts[2] or ""
+    return parts[1] or "-", parts[2] or "-"
 end
-
 State.KosanOwner, State.RoomNumber = parseKosanID(State.CurrentKosanID)
 
 -- RESOLVE NETWORK ENDPOINT
-local Event = nil
+local CleanEvent = nil
 pcall(function()
-    Event = ReplicatedStorage:WaitForChild("NKSystem", 5)
-        :WaitForChild("Packages", 5)
-        :WaitForChild("Knit", 5)
-        :WaitForChild("Services", 5)
-        :WaitForChild("KosanStateService", 5)
-        :WaitForChild("RE", 5)
-        :WaitForChild("CleanProgress", 5)
+    CleanEvent = ReplicatedStorage:WaitForChild("NKSystem", 3)
+        :WaitForChild("Packages", 3)
+        :WaitForChild("Knit", 3)
+        :WaitForChild("Services", 3)
+        :WaitForChild("KosanStateService", 3)
+        :WaitForChild("RE", 3)
+        :WaitForChild("CleanProgress", 3)
 end)
 
--- LOGIC: Trigger Event
 local function fireCleanSignal(targetId)
-    if not Event then return end
-
+    if not CleanEvent then return end
     if typeof(firesignal) == "function" then
-        firesignal(Event.OnClientEvent, targetId, "Kotor", true)
+        firesignal(CleanEvent.OnClientEvent, targetId, "Kotor", true)
     else
-        pcall(function()
-            Event:FireServer(targetId, "Kotor", true)
-        end)
+        pcall(function() CleanEvent:FireServer(targetId, "Kotor", true) end)
     end
 end
 
--- LOGIC: Deteksi Objek
 local function findNearestDirt()
-    local character = LocalPlayer.Character
-    if not character or not character:FindFirstChild("HumanoidRootPart") then return nil end
-    local rootPos = character.HumanoidRootPart.Position
+    local char = LocalPlayer.Character
+    if not char or not char:FindFirstChild("HumanoidRootPart") then return nil end
+    local rootPos = char.HumanoidRootPart.Position
 
-    local nearestTarget = nil
-    local shortestDistance = State.Radius
-
+    local nearest, minDist = nil, State.Radius
     for _, obj in ipairs(Workspace:GetDescendants()) do
         if obj:IsA("BasePart") and obj.Name:lower() == Config.TargetName:lower() then
             if obj.Material == Config.TargetMaterial then
-                local distance = (obj.Position - rootPos).Magnitude
-                if distance <= shortestDistance then
-                    shortestDistance = distance
-                    nearestTarget = obj
+                local dist = (obj.Position - rootPos).Magnitude
+                if dist <= minDist then
+                    minDist = dist
+                    nearest = obj
                 end
             end
         end
     end
-
-    return nearestTarget
+    return nearest
 end
 
--- MAIN WORKER LOOP
+-- BACKGROUND WORKER LOOP (Tetap berjalan meski UI diminimalkan)
 task.spawn(function()
-    while true do
+    while State.IsRunning do
         if State.IsEnabled then
             local target = findNearestDirt()
             if target then
                 fireCleanSignal(State.CurrentKosanID)
-                
                 local prompt = target:FindFirstChildWhichIsA("ProximityPrompt", true)
                 if prompt and prompt.Enabled and typeof(fireproximityprompt) == "function" then
                     fireproximityprompt(prompt)
                 end
             end
         end
-        -- Delay dinamis mengikuti input UI
         task.wait(State.LoopInterval)
     end
 end)
@@ -116,150 +103,184 @@ end)
 local ScreenGui = Instance.new("ScreenGui")
 ScreenGui.Name = "AutoClean_UI"
 ScreenGui.ResetOnSpawn = false
-
-local success, _ = pcall(function() ScreenGui.Parent = CoreGui end)
-if not success then ScreenGui.Parent = PlayerGui end
+local ok = pcall(function() ScreenGui.Parent = CoreGui end)
+if not ok then ScreenGui.Parent = PlayerGui end
 
 local MainFrame = Instance.new("Frame")
 MainFrame.Name = "MainFrame"
-MainFrame.Size = UDim2.new(0, 260, 0, 280)
+MainFrame.Size = UDim2.new(0, 260, 0, Config.FullHeight)
 MainFrame.Position = UDim2.new(0.5, -130, 0.35, 0)
 MainFrame.BackgroundColor3 = Color3.fromRGB(24, 24, 28)
 MainFrame.BorderSizePixel = 0
+MainFrame.ClipsDescendants = true
 MainFrame.Active = true
 MainFrame.Draggable = true
 MainFrame.Parent = ScreenGui
 
-local UICorner = Instance.new("UICorner", MainFrame)
-UICorner.CornerRadius = UDim.new(0, 10)
+local MainCorner = Instance.new("UICorner", MainFrame)
+MainCorner.CornerRadius = UDim.new(0, 10)
 
-local UIStroke = Instance.new("UIStroke", MainFrame)
-UIStroke.Color = Color3.fromRGB(50, 50, 60)
-UIStroke.Thickness = 1.2
+local MainStroke = Instance.new("UIStroke", MainFrame)
+MainStroke.Color = Color3.fromRGB(50, 50, 60)
+MainStroke.Thickness = 1.2
 
--- Title
+-- HEADER BAR
+local Header = Instance.new("Frame")
+Header.Size = UDim2.new(1, 0, 0, Config.MiniHeight)
+Header.BackgroundTransparency = 1
+Header.Parent = MainFrame
+
 local Title = Instance.new("TextLabel")
-Title.Size = UDim2.new(1, 0, 0, 30)
+Title.Size = UDim2.new(1, -65, 1, 0)
+Title.Position = UDim2.new(0, 12, 0, 0)
 Title.BackgroundTransparency = 1
-Title.Text = "Kosan Cleaner Config"
-Title.TextColor3 = Color3.fromRGB(255, 255, 255)
-Title.TextSize = 14
+Title.Text = "Kosan Cleaner"
+Title.TextColor3 = Color3.fromRGB(240, 240, 240)
+Title.TextSize = 13
 Title.Font = Enum.Font.GothamBold
-Title.Parent = MainFrame
+Title.TextXAlignment = Enum.TextXAlignment.Left
+Title.Parent = Header
 
--- Helper Function: Generator Input Field
+-- Minimize Button (−)
+local MiniBtn = Instance.new("TextButton")
+MiniBtn.Size = UDim2.new(0, 22, 0, 22)
+MiniBtn.Position = UDim2.new(1, -52, 0, 7)
+MiniBtn.BackgroundColor3 = Color3.fromRGB(36, 36, 44)
+MiniBtn.Text = "−"
+MiniBtn.TextColor3 = Color3.fromRGB(200, 200, 200)
+MiniBtn.Font = Enum.Font.GothamBold
+MiniBtn.TextSize = 12
+MiniBtn.AutoButtonColor = false
+MiniBtn.Parent = Header
+Instance.new("UICorner", MiniBtn).CornerRadius = UDim.new(0, 5)
+
+-- Exit Button (✕)
+local ExitBtn = Instance.new("TextButton")
+ExitBtn.Size = UDim2.new(0, 22, 0, 22)
+ExitBtn.Position = UDim2.new(1, -27, 0, 7)
+ExitBtn.BackgroundColor3 = Color3.fromRGB(36, 36, 44)
+ExitBtn.Text = "✕"
+ExitBtn.TextColor3 = Color3.fromRGB(220, 80, 80)
+ExitBtn.Font = Enum.Font.GothamBold
+ExitBtn.TextSize = 11
+ExitBtn.AutoButtonColor = false
+ExitBtn.Parent = Header
+Instance.new("UICorner", ExitBtn).CornerRadius = UDim.new(0, 5)
+
+-- CONTENT CONTAINER (Disembunyikan saat diminimalkan)
+local Content = Instance.new("Frame")
+Content.Name = "Content"
+Content.Size = UDim2.new(1, 0, 1, -Config.MiniHeight)
+Content.Position = UDim2.new(0, 0, 0, Config.MiniHeight)
+Content.BackgroundTransparency = 1
+Content.Parent = MainFrame
+
 local function createInputField(name, placeholder, defaultValue, posY)
     local box = Instance.new("TextBox")
     box.Name = name
-    box.Size = UDim2.new(0.85, 0, 0, 28)
-    box.Position = UDim2.new(0.075, 0, 0, posY)
-    box.BackgroundColor3 = Color3.fromRGB(35, 35, 42)
-    box.TextColor3 = Color3.fromRGB(220, 220, 220)
+    box.Size = UDim2.new(0.88, 0, 0, 28)
+    box.Position = UDim2.new(0.06, 0, 0, posY)
+    box.BackgroundColor3 = Color3.fromRGB(34, 34, 40)
+    box.TextColor3 = Color3.fromRGB(225, 225, 225)
     box.Text = tostring(defaultValue)
     box.PlaceholderText = placeholder
+    box.PlaceholderColor3 = Color3.fromRGB(110, 110, 120)
     box.Font = Enum.Font.Gotham
     box.TextSize = 11
-    box.Parent = MainFrame
-
-    local corner = Instance.new("UICorner", box)
-    corner.CornerRadius = UDim.new(0, 6)
-    
+    box.Parent = Content
+    Instance.new("UICorner", box).CornerRadius = UDim.new(0, 6)
     return box
 end
 
--- 1. Input ID Kosan
-local IdInput = createInputField("IdInput", "Format: UserID_RoomID", State.CurrentKosanID, 36)
+local IdInput     = createInputField("IdInput", "Format: UserID_RoomID", State.CurrentKosanID, 6)
+local RadiusInput = createInputField("RadiusInput", "Radius Deteksi (Studs)", State.Radius, 40)
+local LoopInput   = createInputField("LoopInput", "Loop Interval (Detik)", State.LoopInterval, 74)
 
--- 2. Input Radius (Studs)
-local RadiusInput = createInputField("RadiusInput", "Radius Deteksi (Studs)", State.Radius, 72)
-
--- 3. Input Loop Interval (Detik)
-local LoopInput = createInputField("LoopInput", "Loop Interval (Detik, cth: 0.5)", State.LoopInterval, 108)
-
--- Info Label (Parsed ID Display)
 local InfoLabel = Instance.new("TextLabel")
-InfoLabel.Size = UDim2.new(0.85, 0, 0, 20)
-InfoLabel.Position = UDim2.new(0.075, 0, 0, 144)
+InfoLabel.Size = UDim2.new(0.88, 0, 0, 18)
+InfoLabel.Position = UDim2.new(0.06, 0, 0, 108)
 InfoLabel.BackgroundTransparency = 1
 InfoLabel.TextColor3 = Color3.fromRGB(140, 140, 150)
-InfoLabel.TextSize = 11
+InfoLabel.TextSize = 10
 InfoLabel.Font = Enum.Font.Gotham
 InfoLabel.Text = string.format("Owner: %s | Room: %s", State.KosanOwner, State.RoomNumber)
-InfoLabel.Parent = MainFrame
+InfoLabel.Parent = Content
 
--- Status Settings Label
-local StatusParamLabel = Instance.new("TextLabel")
-StatusParamLabel.Size = UDim2.new(0.85, 0, 0, 20)
-StatusParamLabel.Position = UDim2.new(0.075, 0, 0, 166)
-StatusParamLabel.BackgroundTransparency = 1
-StatusParamLabel.TextColor3 = Color3.fromRGB(140, 140, 150)
-StatusParamLabel.TextSize = 11
-StatusParamLabel.Font = Enum.Font.Gotham
-StatusParamLabel.Text = string.format("Radius: %s studs | Loop: %ss", State.Radius, State.LoopInterval)
-StatusParamLabel.Parent = MainFrame
+local StatusLabel = Instance.new("TextLabel")
+StatusLabel.Size = UDim2.new(0.88, 0, 0, 18)
+StatusLabel.Position = UDim2.new(0.06, 0, 0, 126)
+StatusLabel.BackgroundTransparency = 1
+StatusLabel.TextColor3 = Color3.fromRGB(140, 140, 150)
+StatusLabel.TextSize = 10
+StatusLabel.Font = Enum.Font.Gotham
+StatusLabel.Text = string.format("Radius: %s studs | Loop: %ss", State.Radius, State.LoopInterval)
+StatusLabel.Parent = Content
 
--- Toggle Button
 local ToggleBtn = Instance.new("TextButton")
-ToggleBtn.Size = UDim2.new(0.85, 0, 0, 36)
-ToggleBtn.Position = UDim2.new(0.075, 0, 0, 204)
+ToggleBtn.Size = UDim2.new(0.88, 0, 0, 34)
+ToggleBtn.Position = UDim2.new(0.06, 0, 0, 152)
 ToggleBtn.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
 ToggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
 ToggleBtn.Font = Enum.Font.GothamBold
-ToggleBtn.TextSize = 13
+ToggleBtn.TextSize = 12
 ToggleBtn.Text = "AUTO CLEAN: OFF"
 ToggleBtn.AutoButtonColor = false
-ToggleBtn.Parent = MainFrame
-
-local BtnCorner = Instance.new("UICorner", ToggleBtn)
-BtnCorner.CornerRadius = UDim.new(0, 6)
+ToggleBtn.Parent = Content
+Instance.new("UICorner", ToggleBtn).CornerRadius = UDim.new(0, 6)
 
 -- ====================================================================
--- INPUT BINDINGS & SANITIZATION
+-- EVENT HANDLERS
 -- ====================================================================
 
--- Handler Kosan ID
-IdInput.FocusLost:Connect(function()
+table.insert(Connections, IdInput.FocusLost:Connect(function()
     State.CurrentKosanID = IdInput.Text
-    local owner, room = parseKosanID(IdInput.Text)
-    State.KosanOwner = owner
-    State.RoomNumber = room
-    InfoLabel.Text = string.format("Owner: %s | Room: %s", owner, room)
-end)
+    local o, r = parseKosanID(IdInput.Text)
+    State.KosanOwner, State.RoomNumber = o, r
+    InfoLabel.Text = string.format("Owner: %s | Room: %s", o, r)
+end))
 
--- Handler Radius (Validasi angka > 0)
-RadiusInput.FocusLost:Connect(function()
-    local parsed = tonumber(RadiusInput.Text)
-    if parsed and parsed > 0 then
-        State.Radius = parsed
-    else
-        State.Radius = Config.DefaultRadius
-        RadiusInput.Text = tostring(Config.DefaultRadius)
-    end
-    StatusParamLabel.Text = string.format("Radius: %s studs | Loop: %ss", State.Radius, State.LoopInterval)
-end)
+table.insert(Connections, RadiusInput.FocusLost:Connect(function()
+    local val = tonumber(RadiusInput.Text)
+    State.Radius = (val and val > 0) and val or Config.DefaultRadius
+    RadiusInput.Text = tostring(State.Radius)
+    StatusLabel.Text = string.format("Radius: %s studs | Loop: %ss", State.Radius, State.LoopInterval)
+end))
 
--- Handler Loop Delay (Validasi angka >= MinLoopInterval)
-LoopInput.FocusLost:Connect(function()
-    local parsed = tonumber(LoopInput.Text)
-    if parsed and parsed >= Config.MinLoopInterval then
-        State.LoopInterval = parsed
-    else
-        State.LoopInterval = Config.DefaultLoop
-        LoopInput.Text = tostring(Config.DefaultLoop)
-    end
-    StatusParamLabel.Text = string.format("Radius: %s studs | Loop: %ss", State.Radius, State.LoopInterval)
-end)
+table.insert(Connections, LoopInput.FocusLost:Connect(function()
+    local val = tonumber(LoopInput.Text)
+    State.LoopInterval = (val and val >= Config.MinLoopInterval) and val or Config.DefaultLoop
+    LoopInput.Text = tostring(State.LoopInterval)
+    StatusLabel.Text = string.format("Radius: %s studs | Loop: %ss", State.Radius, State.LoopInterval)
+end))
 
--- Handler Toggle Button
-ToggleBtn.MouseButton1Click:Connect(function()
+-- Toggle Script Run/Pause
+table.insert(Connections, ToggleBtn.MouseButton1Click:Connect(function()
     State.IsEnabled = not State.IsEnabled
+    local col = State.IsEnabled and Color3.fromRGB(45, 170, 75) or Color3.fromRGB(200, 50, 50)
+    TweenService:Create(ToggleBtn, TweenInfo.new(0.2), {BackgroundColor3 = col}):Play()
+    ToggleBtn.Text = State.IsEnabled and "AUTO CLEAN: ON" or "AUTO CLEAN: OFF"
+end))
+
+-- Minimize / Expand Animation
+table.insert(Connections, MiniBtn.MouseButton1Click:Connect(function()
+    State.IsMinimized = not State.IsMinimized
+    local targetHeight = State.IsMinimized and Config.MiniHeight or Config.FullHeight
     
-    local targetColor = State.IsEnabled and Color3.fromRGB(46, 180, 80) or Color3.fromRGB(200, 50, 50)
-    local targetText = State.IsEnabled and "AUTO CLEAN: ON" or "AUTO CLEAN: OFF"
-    
-    TweenService:Create(ToggleBtn, TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
-        BackgroundColor3 = targetColor
+    Content.Visible = not State.IsMinimized
+    MiniBtn.Text = State.IsMinimized and "+" or "−"
+
+    TweenService:Create(MainFrame, TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+        Size = UDim2.new(0, 260, 0, targetHeight)
     }):Play()
-    
-    ToggleBtn.Text = targetText
-end)
+end))
+
+-- Exit & Cleanup
+table.insert(Connections, ExitBtn.MouseButton1Click:Connect(function()
+    State.IsRunning = false
+    State.IsEnabled = false
+    for _, conn in ipairs(Connections) do
+        if conn and conn.Disconnect then conn:Disconnect() end
+    end
+    table.clear(Connections)
+    ScreenGui:Destroy()
+end))
