@@ -19,8 +19,8 @@ local Connections = {}
 local PlantConfig = {
     CROP_NAME = "Cabai",
     BUY_COUNT = 100,
-    INTER_ACTION_DELAY = 0.05,
-    CYCLE_COOLDOWN = 0.08,
+    INTER_ACTION_DELAY = 0.10,
+    CYCLE_COOLDOWN = 0.10,
     DEFAULT_LAHAN = "Semua Lahan"
 }
 
