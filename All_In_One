@@ -1,13 +1,3 @@
---[[
-    ╔═══════════════════════════════════════════════════════════════╗
-    ║                 ⚡ INDO-KOST ULTRA HUB v2.5 ⚡                 ║
-    ║                 👑 MADE BY SMITH GANTENG 👑                   ║
-    ║       Modern Cyber Dark Edition - All-In-One Automation       ║
-    ║  - Auto Plant: Multi-Plot Selection (Kanan 1-4 & Kiri 1-4)    ║
-    ║  - Auto Clean: Remote Signal + Auto Proximity Prompt Dirt     ║
-    ║  - High-End Glassmorphism UI with UIGradient & Micro-Tweens   ║
-    ╚═══════════════════════════════════════════════════════════════╝
---]]
 
 -- SERVICES
 local Players = game:GetService("Players")
@@ -311,7 +301,7 @@ local function stopCleaningLoop()
 end
 
 -- ========================================================
--- HIGH-END CYBER GUI DESIGN (MADE BY SMITH GANTENG)
+-- HIGH-END CYBER GUI DESIGN (SMITH GANTENG)
 -- ========================================================
 local WIN_WIDTH = 340
 local WIN_HEIGHT = 405
@@ -415,7 +405,7 @@ SubTitleLabel.Size = UDim2.new(1, -160, 0, 14)
 SubTitleLabel.Position = UDim2.new(0, 48, 0, 25)
 SubTitleLabel.BackgroundTransparency = 1
 SubTitleLabel.Font = Enum.Font.GothamBold
-SubTitleLabel.Text = "👑 BY SMITH GANTENG"
+SubTitleLabel.Text = "👑 SMITH GANTENG"
 SubTitleLabel.TextColor3 = Color3.fromRGB(251, 191, 36)
 SubTitleLabel.TextSize = 9
 SubTitleLabel.TextXAlignment = Enum.TextXAlignment.Left
@@ -824,7 +814,7 @@ CleanBtnGrad.Color = ColorSequence.new({
 })
 
 -- ========================================================
--- FOOTER BAR (CREDIT: MADE BY SMITH GANTENG)
+-- FOOTER BAR (CREDIT: SMITH GANTENG)
 -- ========================================================
 local Footer = Instance.new("Frame")
 Footer.Name = "Footer"
@@ -842,7 +832,7 @@ local FooterLabel = Instance.new("TextLabel")
 FooterLabel.Size = UDim2.new(1, 0, 1, 0)
 FooterLabel.BackgroundTransparency = 1
 FooterLabel.Font = Enum.Font.GothamBold
-FooterLabel.Text = "✨ Made by smith ganteng ✨"
+FooterLabel.Text = "✨ smith ganteng ✨"
 FooterLabel.TextColor3 = Color3.fromRGB(251, 191, 36)
 FooterLabel.TextSize = 10
 FooterLabel.Parent = Footer
@@ -1019,3 +1009,4 @@ table.insert(Connections, CloseBtn.MouseButton1Click:Connect(function()
 
     ScreenGui:Destroy()
 end))
+```
