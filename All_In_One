@@ -19,8 +19,8 @@ local Connections = {}
 local PlantConfig = {
     CROP_NAME = "Cabai",
     BUY_COUNT = 100,
-    INTER_ACTION_DELAY = 0.15,
-    CYCLE_COOLDOWN = 0.10,
+    INTER_ACTION_DELAY = 0.05,
+    CYCLE_COOLDOWN = 0.08,
     DEFAULT_LAHAN = "Semua Lahan"
 }
 
@@ -137,7 +137,7 @@ local CleanConfig = {
     TargetName = "kotoran",
     TargetMaterial = Enum.Material.Plastic,
     DefaultKosanID = "8833771934_19",
-    DefaultRadius = 50,
+    DefaultRadius = 10000,
     DefaultLoop = 0.5,
     MinLoopInterval = 0.05,
 }
