@@ -1,1011 +1,240 @@
+--[[
+    AUTO BUANG SAMPAH v3 — MULTI TONG
+    Author : Cobalt (refactored)
 
+    Alur :
+      ZonaPlastikSammpah
+         └── SpawanPlastikSampah        (item sampah)
+      Temmpatsampah  (parent)
+         ├── TemmmpatSampah
+         ├── TemmmpatSampah1
+         └── TemmmpatSampah2            (target buang)
+
+    Fitur : Multi tong, mode pemilihan, GUI minimize + exit, guard anti-loop.
+--]]
+
+-- ============================================================
 -- SERVICES
-local Players = game:GetService("Players")
-local Workspace = game:GetService("Workspace")
+-- ============================================================
+local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local TweenService = game:GetService("TweenService")
-local CoreGui = game:GetService("CoreGui")
+local TweenService      = game:GetService("TweenService")
+local CoreGui           = game:GetService("CoreGui")
 
 local LocalPlayer = Players.LocalPlayer
-local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
--- ========================================================
--- CONFIGURATION & STATE
--- ========================================================
-local isScriptRunning = true
-local Connections = {}
+-- ============================================================
+-- KONFIGURASI
+-- ============================================================
+local CONFIG = {
+    -- Item sampah
+    SampahName       = "SpawanPlastikSampah",
+    ZonaSampahParent = "ZonaPlastikSammpah",
 
--- 1. Auto Plant Configuration
-local PlantConfig = {
-    CROP_NAME = "Cabai",
-    BUY_COUNT = 100,
-    INTER_ACTION_DELAY = 0.10,
-    CYCLE_COOLDOWN = 0.10,
-    DEFAULT_LAHAN = "Semua Lahan"
+    -- Parent tong sampah
+    TongSampahParent = "Temmpatsampah",
+
+    -- Daftar tong (urutan prioritas)
+    TongSampahNames  = {
+        "TemmmpatSampah",
+        "TemmmpatSampah1",
+        "TemmmpatSampah2",
+    },
+
+    -- "roundrobin" | "nearest" | "first"
+    Mode             = "roundrobin",
+
+    Interval         = 0.25,
+    AutoStart        = true,
+    FallbackRecursive = true,   -- cari ke seluruh workspace kalau parent tidak ketemu
+    MoveMethod       = "parent",-- "parent" = ganti Parent | "cframe" = pindah posisi
 }
 
-local LAHAN_LIST = {
-    ["Lahan Kanan 1"] = {
-        Vector3.new(-618.5881958007812, 15.499999046325684, -252.45172119140625),
-        Vector3.new(-632.3125, 15.499999046325684, -253.161865234375),
-        Vector3.new(-590.6769409179688, 15.500000953674316, -247.18519592285156),
-        Vector3.new(-603.5460815429688, 15.500000953674316, -251.08877563476562),
-    },
-    ["Lahan Kanan 2"] = {
-        Vector3.new(-517.0890502929688, 15.5, -250.7201690673828),
-        Vector3.new(-531.0599975585938, 15.500000953674316, -252.03182983398438),
-        Vector3.new(-544.1796264648438, 15.5, -251.0286407470703),
-        Vector3.new(-556.2644653320312, 15.5, -244.6540069580078),
-    },
-    ["Lahan Kanan 3"] = {
-        Vector3.new(-482.7235107421875, 15.499999046325684, -248.57882690429688),
-        Vector3.new(-470.6371765136719, 15.5, -249.12124633789062),
-        Vector3.new(-456.2996520996094, 15.5, -248.90750122070312),
-        Vector3.new(-443.5169982910156, 15.5, -249.10556030273438),
-    },
-    ["Lahan Kanan 4"] = {
-        Vector3.new(-408.9349060058594, 15.5, -252.46971130371094),
-        Vector3.new(-397.1911315917969, 15.5, -249.8361358642578),
-        Vector3.new(-382.33148193359375, 15.5, -242.9317626953125),
-        Vector3.new(-370.10791015625, 15.5, -239.33607482910156),
-    },
-    ["Lahan Kiri 1"] = {
-        Vector3.new(-630.9166259765625, 15.5, -321.91656494140625),
-        Vector3.new(-618.759521484375, 15.5, -324.889892578125),
-        Vector3.new(-604.3545532226562, 15.5, -323.1783752441406),
-        Vector3.new(-590.7984619140625, 15.5, -320.9075012207031),
-    },
-    ["Lahan Kiri 2"] = {
-        Vector3.new(-557.5001831054688, 15.5, -314.1703186035156),
-        Vector3.new(-544.183837890625, 15.5, -316.4648132324219),
-        Vector3.new(-530.4700927734375, 15.5, -317.07122802734375),
-        Vector3.new(-516.580322265625, 15.500000953674316, -316.50634765625),
-    },
-    ["Lahan Kiri 3"] = {
-        Vector3.new(-516.580322265625, 15.500000953674316, -316.50634765625),
-        Vector3.new(-470.6393127441406, 15.5, -326.2953186035156),
-        Vector3.new(-456.388916015625, 15.500000953674316, -322.6510925292969),
-        Vector3.new(-443.1785888671875, 15.5, -319.5091247558594),
-    },
-    ["Lahan Kiri 4"] = {
-        Vector3.new(-410.2164306640625, 15.5, -298.1622619628906),
-        Vector3.new(-396.0249938964844, 15.499999046325684, -300.63201904296875),
-        Vector3.new(-382.8375244140625, 15.5, -301.8544006347656),
-        Vector3.new(-368.1260070800781, 15.5, -305.3680419921875),
-    },
-}
+-- ============================================================
+-- EVENT PlayPickupAnim
+-- ============================================================
+local PlayPickupAnim
+do
+    local ok, res = pcall(function()
+        return ReplicatedStorage
+            .NKSystem.Packages.Knit.Services
+            .KosanStateService.RE.PlayPickupAnim
+    end)
+    if ok then PlayPickupAnim = res
+    else warn("[AutoSampah] Event PlayPickupAnim tidak ditemukan!") end
+end
 
-local function mergePlotGroups(names)
-    local combined = {}
-    for _, name in ipairs(names) do
-        local plots = LAHAN_LIST[name]
-        if plots then
-            for _, pos in ipairs(plots) do
-                table.insert(combined, pos)
-            end
+local function FirePickupAnim(state)
+    if not PlayPickupAnim then return end
+    if type(firesignal) == "function" then
+        firesignal(PlayPickupAnim.OnClientEvent, state)
+    else
+        pcall(function() PlayPickupAnim:Fire(state) end)
+    end
+end
+
+-- ============================================================
+-- HELPER: Cari object dari parent zone
+-- ============================================================
+local function FindFromParent(parentName, childName)
+    local parent = workspace:FindFirstChild(parentName, true)
+    if parent then
+        local child = parent:FindFirstChild(childName, true)
+        if child then return child, parent end
+    end
+    if CONFIG.FallbackRecursive then
+        return workspace:FindFirstChild(childName, true), parent
+    end
+    return nil, parent
+end
+
+-- Posisi aman untuk Model / Folder / BasePart
+local function GetPosition(inst)
+    if not inst then return nil end
+    if inst:IsA("BasePart") then return inst.Position end
+    local pp = inst.PrimaryPart or inst:FindFirstChild("HumanoidRootPart")
+    if pp and pp:IsA("BasePart") then return pp.Position end
+    return nil
+end
+
+-- ============================================================
+-- HELPER: Ambil semua tong yang tersedia
+-- ============================================================
+local function GetAvailableBins()
+    local list = {}
+    for i, name in ipairs(CONFIG.TongSampahNames) do
+        local obj = FindFromParent(CONFIG.TongSampahParent, name)
+        if obj then
+            table.insert(list, { index = i, name = name, obj = obj })
         end
     end
-    return combined
+    return list
 end
 
-local LAHAN_CATEGORIES = {
-    "Semua Lahan",
-    "Semua Kanan",
-    "Semua Kiri",
-    "Lahan Kanan 1",
-    "Lahan Kanan 2",
-    "Lahan Kanan 3",
-    "Lahan Kanan 4",
-    "Lahan Kiri 1",
-    "Lahan Kiri 2",
-    "Lahan Kiri 3",
-    "Lahan Kiri 4"
-}
+-- ============================================================
+-- PEMILIHAN TONG
+-- ============================================================
+local rrIndex = 0
 
-local LAHAN_PRESETS = {
-    ["Semua Lahan"] = mergePlotGroups({
-        "Lahan Kanan 1", "Lahan Kanan 2", "Lahan Kanan 3", "Lahan Kanan 4",
-        "Lahan Kiri 1", "Lahan Kiri 2", "Lahan Kiri 3", "Lahan Kiri 4"
-    }),
-    ["Semua Kanan"] = mergePlotGroups({"Lahan Kanan 1", "Lahan Kanan 2", "Lahan Kanan 3", "Lahan Kanan 4"}),
-    ["Semua Kiri"]  = mergePlotGroups({"Lahan Kiri 1", "Lahan Kiri 2", "Lahan Kiri 3", "Lahan Kiri 4"}),
-    ["Lahan Kanan 1"] = LAHAN_LIST["Lahan Kanan 1"],
-    ["Lahan Kanan 2"] = LAHAN_LIST["Lahan Kanan 2"],
-    ["Lahan Kanan 3"] = LAHAN_LIST["Lahan Kanan 3"],
-    ["Lahan Kanan 4"] = LAHAN_LIST["Lahan Kanan 4"],
-    ["Lahan Kiri 1"]  = LAHAN_LIST["Lahan Kiri 1"],
-    ["Lahan Kiri 2"]  = LAHAN_LIST["Lahan Kiri 2"],
-    ["Lahan Kiri 3"]  = LAHAN_LIST["Lahan Kiri 3"],
-    ["Lahan Kiri 4"]  = LAHAN_LIST["Lahan Kiri 4"],
-}
+local function PickBin(bins)
+    if #bins == 0 then return nil end
 
-local currentLahanIndex = 1
-for idx, name in ipairs(LAHAN_CATEGORIES) do
-    if name == PlantConfig.DEFAULT_LAHAN then
-        currentLahanIndex = idx
-        break
+    if CONFIG.Mode == "first" then
+        return bins[1]
     end
+
+    if CONFIG.Mode == "nearest" then
+        local char = LocalPlayer.Character
+        local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+        if not hrp then return bins[1] end
+
+        local best, bestDist = bins[1], math.huge
+        for _, b in ipairs(bins) do
+            local pos = GetPosition(b.obj)
+            if pos then
+                local d = (pos - hrp.Position).Magnitude
+                if d < bestDist then best, bestDist = b, d end
+            end
+        end
+        return best
+    end
+
+    -- roundrobin
+    rrIndex = (rrIndex % #bins) + 1
+    return bins[rrIndex]
 end
 
-local function getActivePlots()
-    local name = LAHAN_CATEGORIES[currentLahanIndex]
-    return LAHAN_PRESETS[name] or {}
+-- ============================================================
+-- CORE
+-- ============================================================
+local Running    = CONFIG.AutoStart
+local LastBinTxt = "-"
+
+-- Guard: cegah item dianggap "sampah" jika sudah ada di dalam tong
+local function IsInsideAnyBin(item, bins)
+    for _, b in ipairs(bins) do
+        if item:IsDescendantOf(b.obj) then return true end
+    end
+    return false
 end
 
--- 2. Auto Clean Configuration
-local CleanConfig = {
-    TargetName = "kotoran",
-    TargetMaterial = Enum.Material.Plastic,
-    DefaultKosanID = "8833771934_19",
-    DefaultRadius = 100000,
-    DefaultLoop = 0.3,
-    MinLoopInterval = 0.05,
-}
+local function AmbilDanBuangSampah()
+    -- 1) Ambil sampah
+    local sampah = FindFromParent(CONFIG.ZonaSampahParent, CONFIG.SampahName)
+    if not sampah then return end
 
-local CleanState = {
-    CurrentKosanID = CleanConfig.DefaultKosanID,
-    KosanOwner = "",
-    RoomNumber = "",
-    Radius = CleanConfig.DefaultRadius,
-    LoopInterval = CleanConfig.DefaultLoop
-}
+    -- 2) Cek tong tersedia
+    local bins = GetAvailableBins()
+    if #bins == 0 then return end
 
-local function parseKosanID(idString)
-    local parts = string.split(tostring(idString), "_")
-    return parts[1] or "-", parts[2] or "-"
-end
-CleanState.KosanOwner, CleanState.RoomNumber = parseKosanID(CleanState.CurrentKosanID)
+    -- 3) Guard anti-loop
+    if IsInsideAnyBin(sampah, bins) then return end
 
--- ========================================================
--- NETWORK RESOLVERS
--- ========================================================
--- Knit Tanam Service
-local function resolvePlantRemote(remoteName: string)
-    local success, remote = pcall(function()
-        return ReplicatedStorage
-            :WaitForChild("NKSystem", 5)
-            :WaitForChild("Packages", 5)
-            :WaitForChild("Knit", 5)
-            :WaitForChild("Services", 5)
-            :WaitForChild("TanamService", 5)
-            :WaitForChild("RF", 5)
-            :WaitForChild(remoteName, 5)
+    -- 4) Trigger anim pickup
+    FirePickupAnim(false)
+
+    -- 5) Pilih tong & buang
+    local target = PickBin(bins)
+    if not target then return end
+
+    pcall(function()
+        if CONFIG.MoveMethod == "cframe" then
+            local srcPos  = GetPosition(sampah)
+            local destPos = GetPosition(target.obj)
+            if sampah:IsA("BasePart") and destPos then
+                sampah.CFrame = CFrame.new(destPos)
+            elseif srcPos and destPos then
+                -- model: geser via PivotTo
+                sampah:PivotTo(CFrame.new(destPos))
+            end
+            -- tetap reparent agar sistem game mendeteksi
+            sampah.Parent = target.obj
+        else
+            sampah.Parent = target.obj
+        end
     end)
-    return if success then remote else nil
+
+    LastBinTxt = target.name
 end
 
-local beliBibitRF = resolvePlantRemote("BeliBibit")
-local tanamRF = resolvePlantRemote("Tanam")
-
--- Kosan Clean Remote
-local CleanEvent = nil
-pcall(function()
-    CleanEvent = ReplicatedStorage
-        :WaitForChild("NKSystem", 5)
-        :WaitForChild("Packages", 5)
-        :WaitForChild("Knit", 5)
-        :WaitForChild("Services", 5)
-        :WaitForChild("KosanStateService", 5)
-        :WaitForChild("RE", 5)
-        :WaitForChild("CleanProgress", 5)
+-- ============================================================
+-- LOOP UTAMA
+-- ============================================================
+task.spawn(function()
+    while task.wait(CONFIG.Interval) do
+        if Running then
+            pcall(AmbilDanBuangSampah)
+        end
+    end
 end)
 
-local function fireCleanSignal(targetId)
-    if not CleanEvent then return end
-    if typeof(firesignal) == "function" then
-        firesignal(CleanEvent.OnClientEvent, targetId, "Kotor", true)
-    else
-        pcall(function() CleanEvent:FireServer(targetId, "Kotor", true) end)
-    end
+-- ============================================================
+-- GUI
+-- ============================================================
+local parentGui = (gethui and gethui()) or CoreGui
+if parentGui:FindFirstChild("AutoSampahGUI") then
+    parentGui.AutoSampahGUI:Destroy()
 end
-
-local function findNearestDirt()
-    local char = LocalPlayer.Character
-    if not char or not char:FindFirstChild("HumanoidRootPart") then return nil end
-    local rootPos = char.HumanoidRootPart.Position
-
-    local nearest, minDist = nil, CleanState.Radius
-    for _, obj in ipairs(Workspace:GetDescendants()) do
-        if obj:IsA("BasePart") and obj.Name:lower() == CleanConfig.TargetName:lower() then
-            if obj.Material == CleanConfig.TargetMaterial then
-                local dist = (obj.Position - rootPos).Magnitude
-                if dist <= minDist then
-                    minDist = dist
-                    nearest = obj
-                end
-            end
-        end
-    end
-    return nearest
-end
-
--- ========================================================
--- BACKGROUND WORKERS
--- ========================================================
-local isPlantRunning = false
-local plantThread = nil
-
-local isCleanRunning = false
-local cleanThread = nil
-
-local function executePlantCycle()
-    local activePlots = getActivePlots()
-    if #activePlots == 0 then return end
-
-    if beliBibitRF then
-        local buySuccess, buyErr = pcall(function()
-            return beliBibitRF:InvokeServer(PlantConfig.CROP_NAME, PlantConfig.BUY_COUNT)
-        end)
-        if not buySuccess then
-            warn("[AutoFarm Error]: Beli bibit gagal:", buyErr)
-        end
-    end
-
-    task.wait(PlantConfig.INTER_ACTION_DELAY)
-
-    for index, plotPos in ipairs(activePlots) do
-        if not isPlantRunning or not isScriptRunning then break end
-
-        if tanamRF then
-            local plantSuccess, plantErr = pcall(function()
-                return tanamRF:InvokeServer(PlantConfig.CROP_NAME, plotPos)
-            end)
-            if not plantSuccess then
-                warn(string.format("[AutoFarm Error]: Plot #%d gagal: %s", index, tostring(plantErr)))
-            end
-        end
-
-        task.wait(PlantConfig.INTER_ACTION_DELAY)
-    end
-end
-
-local function startPlantingLoop()
-    plantThread = task.spawn(function()
-        while isPlantRunning and isScriptRunning do
-            executePlantCycle()
-            task.wait(PlantConfig.CYCLE_COOLDOWN)
-        end
-    end)
-end
-
-local function stopPlantingLoop()
-    isPlantRunning = false
-    if plantThread then
-        task.cancel(plantThread)
-        plantThread = nil
-    end
-end
-
-local function startCleaningLoop()
-    cleanThread = task.spawn(function()
-        while isCleanRunning and isScriptRunning do
-            local target = findNearestDirt()
-            if target then
-                fireCleanSignal(CleanState.CurrentKosanID)
-                local prompt = target:FindFirstChildWhichIsA("ProximityPrompt", true)
-                if prompt and prompt.Enabled and typeof(fireproximityprompt) == "function" then
-                    fireproximityprompt(prompt)
-                end
-            end
-            task.wait(CleanState.LoopInterval)
-        end
-    end)
-end
-
-local function stopCleaningLoop()
-    isCleanRunning = false
-    if cleanThread then
-        task.cancel(cleanThread)
-        cleanThread = nil
-    end
-end
-
--- ========================================================
--- HIGH-END CYBER GUI DESIGN (SMITH GANTENG)
--- ========================================================
-local WIN_WIDTH = 340
-local WIN_HEIGHT = 405
-local MINI_HEIGHT = 46
-
-local TWEEN_SMOOTH = TweenInfo.new(0.25, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
-local TWEEN_FAST   = TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
 
 local ScreenGui = Instance.new("ScreenGui")
-ScreenGui.Name = "IndoKostUltraHub"
+ScreenGui.Name = "AutoSampahGUI"
 ScreenGui.ResetOnSpawn = false
-ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-
-local pcallGui = pcall(function() ScreenGui.Parent = CoreGui end)
-if not pcallGui or not ScreenGui.Parent then
-    ScreenGui.Parent = PlayerGui
-end
-
--- Main Window
-local MainFrame = Instance.new("Frame")
-MainFrame.Name = "MainFrame"
-MainFrame.Size = UDim2.new(0, WIN_WIDTH, 0, WIN_HEIGHT)
-MainFrame.Position = UDim2.new(0.5, -WIN_WIDTH / 2, 0.20, 0)
-MainFrame.BackgroundColor3 = Color3.fromRGB(15, 17, 24)
-MainFrame.BorderSizePixel = 0
-MainFrame.ClipsDescendants = true
-MainFrame.Active = true
-MainFrame.Draggable = true
-MainFrame.Parent = ScreenGui
-
-local MainCorner = Instance.new("UICorner", MainFrame)
-MainCorner.CornerRadius = UDim.new(0, 14)
-
-local MainStroke = Instance.new("UIStroke", MainFrame)
-MainStroke.Color = Color3.fromRGB(48, 52, 74)
-MainStroke.Thickness = 1.4
-
-local MainGradient = Instance.new("UIGradient", MainFrame)
-MainGradient.Rotation = 45
-MainGradient.Color = ColorSequence.new({
-    ColorSequenceKeypoint.new(0.0, Color3.fromRGB(18, 20, 29)),
-    ColorSequenceKeypoint.new(1.0, Color3.fromRGB(11, 13, 19))
-})
-
--- ========================================================
--- HEADER BAR
--- ========================================================
-local Header = Instance.new("Frame")
-Header.Name = "Header"
-Header.Size = UDim2.new(1, 0, 0, MINI_HEIGHT)
-Header.BackgroundColor3 = Color3.fromRGB(22, 25, 36)
-Header.BorderSizePixel = 0
-Header.Parent = MainFrame
-
-local HeaderCorner = Instance.new("UICorner", Header)
-HeaderCorner.CornerRadius = UDim.new(0, 14)
-
-local HeaderStroke = Instance.new("UIStroke", Header)
-HeaderStroke.Color = Color3.fromRGB(38, 42, 60)
-HeaderStroke.Thickness = 1
-
--- Logo Icon Box
-local LogoBox = Instance.new("Frame")
-LogoBox.Size = UDim2.new(0, 28, 0, 28)
-LogoBox.Position = UDim2.new(0, 12, 0.5, -14)
-LogoBox.BackgroundColor3 = Color3.fromRGB(99, 102, 241)
-LogoBox.BorderSizePixel = 0
-LogoBox.Parent = Header
-Instance.new("UICorner", LogoBox).CornerRadius = UDim.new(0, 7)
-
-local LogoGrad = Instance.new("UIGradient", LogoBox)
-LogoGrad.Rotation = 45
-LogoGrad.Color = ColorSequence.new({
-    ColorSequenceKeypoint.new(0, Color3.fromRGB(139, 92, 246)),
-    ColorSequenceKeypoint.new(1, Color3.fromRGB(59, 130, 246))
-})
-
-local LogoText = Instance.new("TextLabel")
-LogoText.Size = UDim2.new(1, 0, 1, 0)
-LogoText.BackgroundTransparency = 1
-LogoText.Font = Enum.Font.GothamBold
-LogoText.Text = "⚡"
-LogoText.TextColor3 = Color3.fromRGB(255, 255, 255)
-LogoText.TextSize = 14
-LogoText.Parent = LogoBox
-
--- Title & Creator Subtitle (Smith Ganteng)
-local TitleLabel = Instance.new("TextLabel")
-TitleLabel.Size = UDim2.new(1, -160, 0, 18)
-TitleLabel.Position = UDim2.new(0, 48, 0, 7)
-TitleLabel.BackgroundTransparency = 1
-TitleLabel.Font = Enum.Font.GothamBlack
-TitleLabel.Text = "INDO-KOST HUB"
-TitleLabel.TextColor3 = Color3.fromRGB(245, 245, 255)
-TitleLabel.TextSize = 13
-TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
-TitleLabel.Parent = Header
-
-local SubTitleLabel = Instance.new("TextLabel")
-SubTitleLabel.Size = UDim2.new(1, -160, 0, 14)
-SubTitleLabel.Position = UDim2.new(0, 48, 0, 25)
-SubTitleLabel.BackgroundTransparency = 1
-SubTitleLabel.Font = Enum.Font.GothamBold
-SubTitleLabel.Text = "👑 SMITH GANTENG"
-SubTitleLabel.TextColor3 = Color3.fromRGB(251, 191, 36)
-SubTitleLabel.TextSize = 9
-SubTitleLabel.TextXAlignment = Enum.TextXAlignment.Left
-SubTitleLabel.Parent = Header
-
--- Control Buttons (Minimize & Close)
-local HeaderControls = Instance.new("Frame")
-HeaderControls.Size = UDim2.new(0, 68, 1, 0)
-HeaderControls.Position = UDim2.new(1, -74, 0, 0)
-HeaderControls.BackgroundTransparency = 1
-HeaderControls.Parent = Header
-
-local ControlsLayout = Instance.new("UIListLayout", HeaderControls)
-ControlsLayout.FillDirection = Enum.FillDirection.Horizontal
-ControlsLayout.HorizontalAlignment = Enum.HorizontalAlignment.Right
-ControlsLayout.VerticalAlignment = Enum.VerticalAlignment.Center
-ControlsLayout.Padding = UDim.new(0, 6)
-
-local function createHeaderIconBtn(symbol, bgHover, txtColor)
-    local btn = Instance.new("TextButton")
-    btn.Size = UDim2.new(0, 26, 0, 26)
-    btn.BackgroundColor3 = Color3.fromRGB(29, 32, 46)
-    btn.BorderSizePixel = 0
-    btn.Font = Enum.Font.GothamBold
-    btn.Text = symbol
-    btn.TextColor3 = txtColor or Color3.fromRGB(180, 185, 205)
-    btn.TextSize = 11
-    btn.AutoButtonColor = false
-    btn.Parent = HeaderControls
-    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
-    local st = Instance.new("UIStroke", btn)
-    st.Color = Color3.fromRGB(45, 48, 68)
-    st.Thickness = 1
-
-    btn.MouseEnter:Connect(function()
-        TweenService:Create(btn, TWEEN_FAST, { BackgroundColor3 = bgHover }):Play()
-    end)
-    btn.MouseLeave:Connect(function()
-        TweenService:Create(btn, TWEEN_FAST, { BackgroundColor3 = Color3.fromRGB(29, 32, 46) }):Play()
-    end)
-
-    return btn
-end
-
-local MiniBtn = createHeaderIconBtn("—", Color3.fromRGB(48, 52, 75))
-local CloseBtn = createHeaderIconBtn("✕", Color3.fromRGB(225, 29, 72), Color3.fromRGB(255, 120, 140))
-
--- ========================================================
--- TAB BAR (PILL SEGMENTED CONTROLS)
--- ========================================================
-local TabBar = Instance.new("Frame")
-TabBar.Name = "TabBar"
-TabBar.Size = UDim2.new(1, -24, 0, 36)
-TabBar.Position = UDim2.new(0, 12, 0, MINI_HEIGHT + 8)
-TabBar.BackgroundColor3 = Color3.fromRGB(20, 22, 32)
-TabBar.BorderSizePixel = 0
-TabBar.Parent = MainFrame
-Instance.new("UICorner", TabBar).CornerRadius = UDim.new(0, 8)
-local tabStroke = Instance.new("UIStroke", TabBar)
-tabStroke.Color = Color3.fromRGB(36, 40, 58)
-tabStroke.Thickness = 1
-
-local TabListLayout = Instance.new("UIListLayout", TabBar)
-TabListLayout.FillDirection = Enum.FillDirection.Horizontal
-TabListLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
-TabListLayout.VerticalAlignment = Enum.VerticalAlignment.Center
-TabListLayout.Padding = UDim.new(0, 6)
-
-local function createTabPill(title)
-    local btn = Instance.new("TextButton")
-    btn.Size = UDim2.new(0.5, -6, 1, -6)
-    btn.BackgroundColor3 = Color3.fromRGB(20, 22, 32)
-    btn.BorderSizePixel = 0
-    btn.Font = Enum.Font.GothamBold
-    btn.Text = title
-    btn.TextColor3 = Color3.fromRGB(130, 135, 155)
-    btn.TextSize = 11
-    btn.AutoButtonColor = false
-    btn.Parent = TabBar
-    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
-    return btn
-end
-
-local TabPlantBtn = createTabPill("🌱 AUTO PLANT")
-local TabCleanBtn = createTabPill("🧹 AUTO CLEAN")
-
--- ========================================================
--- CONTENT CONTAINER
--- ========================================================
-local ContentFrame = Instance.new("Frame")
-ContentFrame.Name = "ContentFrame"
-ContentFrame.Size = UDim2.new(1, -24, 1, -(MINI_HEIGHT + 80))
-ContentFrame.Position = UDim2.new(0, 12, 0, MINI_HEIGHT + 50)
-ContentFrame.BackgroundTransparency = 1
-ContentFrame.Parent = MainFrame
-
-local function createModernCard(parent, height, posY)
-    local card = Instance.new("Frame")
-    card.Size = UDim2.new(1, 0, 0, height)
-    card.Position = UDim2.new(0, 0, 0, posY)
-    card.BackgroundColor3 = Color3.fromRGB(21, 23, 33)
-    card.BorderSizePixel = 0
-    card.Parent = parent
-    Instance.new("UICorner", card).CornerRadius = UDim.new(0, 8)
-    local stroke = Instance.new("UIStroke", card)
-    stroke.Color = Color3.fromRGB(36, 40, 58)
-    stroke.Thickness = 1
-    return card
-end
-
--- ========================================================
--- TAB 1: AUTO PLANT PAGE
--- ========================================================
-local PlantPage = Instance.new("Frame")
-PlantPage.Name = "PlantPage"
-PlantPage.Size = UDim2.new(1, 0, 1, 0)
-PlantPage.BackgroundTransparency = 1
-PlantPage.Visible = true
-PlantPage.Parent = ContentFrame
-
--- Card 1: Target Bibit & Live Status
-local PlantStatusCard = createModernCard(PlantPage, 48, 0)
-
-local PlantCardIcon = Instance.new("TextLabel")
-PlantCardIcon.Size = UDim2.new(0, 24, 0, 24)
-PlantCardIcon.Position = UDim2.new(0, 12, 0.5, -12)
-PlantCardIcon.BackgroundTransparency = 1
-PlantCardIcon.Font = Enum.Font.GothamBold
-PlantCardIcon.Text = "🌶️"
-PlantCardIcon.TextSize = 16
-PlantCardIcon.Parent = PlantStatusCard
-
-local PlantTargetLabel = Instance.new("TextLabel")
-PlantTargetLabel.Size = UDim2.new(1, -120, 0, 16)
-PlantTargetLabel.Position = UDim2.new(0, 42, 0, 8)
-PlantTargetLabel.BackgroundTransparency = 1
-PlantTargetLabel.Font = Enum.Font.GothamBold
-PlantTargetLabel.Text = "Tanaman: " .. PlantConfig.CROP_NAME
-PlantTargetLabel.TextColor3 = Color3.fromRGB(240, 240, 250)
-PlantTargetLabel.TextSize = 11
-PlantTargetLabel.TextXAlignment = Enum.TextXAlignment.Left
-PlantTargetLabel.Parent = PlantStatusCard
-
-local PlantSubStatus = Instance.new("TextLabel")
-PlantSubStatus.Size = UDim2.new(1, -120, 0, 14)
-PlantSubStatus.Position = UDim2.new(0, 42, 0, 25)
-PlantSubStatus.BackgroundTransparency = 1
-PlantSubStatus.Font = Enum.Font.Gotham
-PlantSubStatus.Text = "Status: Siap Beroperasi"
-PlantSubStatus.TextColor3 = Color3.fromRGB(140, 145, 165)
-PlantSubStatus.TextSize = 10
-PlantSubStatus.TextXAlignment = Enum.TextXAlignment.Left
-PlantSubStatus.Parent = PlantStatusCard
-
-local PlantStatusBadge = Instance.new("Frame")
-PlantStatusBadge.Size = UDim2.new(0, 68, 0, 22)
-PlantStatusBadge.Position = UDim2.new(1, -78, 0.5, -11)
-PlantStatusBadge.BackgroundColor3 = Color3.fromRGB(30, 33, 46)
-PlantStatusBadge.BorderSizePixel = 0
-PlantStatusBadge.Parent = PlantStatusCard
-Instance.new("UICorner", PlantStatusBadge).CornerRadius = UDim.new(0, 6)
-
-local PlantBadgeText = Instance.new("TextLabel")
-PlantBadgeText.Size = UDim2.new(1, 0, 1, 0)
-PlantBadgeText.BackgroundTransparency = 1
-PlantBadgeText.Font = Enum.Font.GothamBold
-PlantBadgeText.Text = "● IDLE"
-PlantBadgeText.TextColor3 = Color3.fromRGB(160, 165, 185)
-PlantBadgeText.TextSize = 9
-PlantBadgeText.Parent = PlantStatusBadge
-
--- Card 2: Lahan Selector (Interactive Stepper)
-local LahanCard = createModernCard(PlantPage, 84, 54)
-
-local LahanCardTitle = Instance.new("TextLabel")
-LahanCardTitle.Size = UDim2.new(1, -24, 0, 16)
-LahanCardTitle.Position = UDim2.new(0, 12, 0, 8)
-LahanCardTitle.BackgroundTransparency = 1
-LahanCardTitle.Font = Enum.Font.GothamBold
-LahanCardTitle.Text = "LOKASI LAHAN AKTIF"
-LahanCardTitle.TextColor3 = Color3.fromRGB(99, 102, 241)
-LahanCardTitle.TextSize = 9
-LahanCardTitle.TextXAlignment = Enum.TextXAlignment.Left
-LahanCardTitle.Parent = LahanCard
-
-local LahanStepperBox = Instance.new("Frame")
-LahanStepperBox.Size = UDim2.new(1, -24, 0, 34)
-LahanStepperBox.Position = UDim2.new(0, 12, 0, 26)
-LahanStepperBox.BackgroundColor3 = Color3.fromRGB(15, 16, 24)
-LahanStepperBox.BorderSizePixel = 0
-LahanStepperBox.Parent = LahanCard
-Instance.new("UICorner", LahanStepperBox).CornerRadius = UDim.new(0, 6)
-local stpStroke = Instance.new("UIStroke", LahanStepperBox)
-stpStroke.Color = Color3.fromRGB(42, 46, 66)
-stpStroke.Thickness = 1
-
-local PrevLahanBtn = Instance.new("TextButton")
-PrevLahanBtn.Size = UDim2.new(0, 32, 1, 0)
-PrevLahanBtn.Position = UDim2.new(0, 0, 0, 0)
-PrevLahanBtn.BackgroundTransparency = 1
-PrevLahanBtn.Font = Enum.Font.GothamBold
-PrevLahanBtn.Text = "◀"
-PrevLahanBtn.TextColor3 = Color3.fromRGB(180, 185, 210)
-PrevLahanBtn.TextSize = 11
-PrevLahanBtn.AutoButtonColor = false
-PrevLahanBtn.Parent = LahanStepperBox
-
-local NextLahanBtn = Instance.new("TextButton")
-NextLahanBtn.Size = UDim2.new(0, 32, 1, 0)
-NextLahanBtn.Position = UDim2.new(1, -32, 0, 0)
-NextLahanBtn.BackgroundTransparency = 1
-NextLahanBtn.Font = Enum.Font.GothamBold
-NextLahanBtn.Text = "▶"
-NextLahanBtn.TextColor3 = Color3.fromRGB(180, 185, 210)
-NextLahanBtn.TextSize = 11
-NextLahanBtn.AutoButtonColor = false
-NextLahanBtn.Parent = LahanStepperBox
-
-local LahanDisplayBtn = Instance.new("TextButton")
-LahanDisplayBtn.Size = UDim2.new(1, -64, 1, 0)
-LahanDisplayBtn.Position = UDim2.new(0, 32, 0, 0)
-LahanDisplayBtn.BackgroundTransparency = 1
-LahanDisplayBtn.Font = Enum.Font.GothamBold
-LahanDisplayBtn.Text = "📍 " .. LAHAN_CATEGORIES[currentLahanIndex] .. " (" .. #getActivePlots() .. " Plots)"
-LahanDisplayBtn.TextColor3 = Color3.fromRGB(245, 245, 255)
-LahanDisplayBtn.TextSize = 10
-LahanDisplayBtn.AutoButtonColor = false
-LahanDisplayBtn.Parent = LahanStepperBox
-
-local LahanSubInfo = Instance.new("TextLabel")
-LahanSubInfo.Size = UDim2.new(1, -24, 0, 14)
-LahanSubInfo.Position = UDim2.new(0, 12, 0, 64)
-LahanSubInfo.BackgroundTransparency = 1
-LahanSubInfo.Font = Enum.Font.Gotham
-LahanSubInfo.Text = "Tekan panah atau klik teks untuk mengganti lahan"
-LahanSubInfo.TextColor3 = Color3.fromRGB(120, 125, 145)
-LahanSubInfo.TextSize = 9
-LahanSubInfo.TextXAlignment = Enum.TextXAlignment.Left
-LahanSubInfo.Parent = LahanCard
-
--- Card 3: Parameter Tanam
-local PlantConfigCard = createModernCard(PlantPage, 36, 144)
-
-local ConfigInfoLabel = Instance.new("TextLabel")
-ConfigInfoLabel.Size = UDim2.new(1, -24, 1, 0)
-ConfigInfoLabel.Position = UDim2.new(0, 12, 0, 0)
-ConfigInfoLabel.BackgroundTransparency = 1
-ConfigInfoLabel.Font = Enum.Font.GothamMedium
-ConfigInfoLabel.Text = string.format("⚡ Beli: %d | Delay: %.2fs | Cooldown: %.2fs", PlantConfig.BUY_COUNT, PlantConfig.INTER_ACTION_DELAY, PlantConfig.CYCLE_COOLDOWN)
-ConfigInfoLabel.TextColor3 = Color3.fromRGB(150, 155, 175)
-ConfigInfoLabel.TextSize = 9
-ConfigInfoLabel.TextXAlignment = Enum.TextXAlignment.Center
-ConfigInfoLabel.Parent = PlantConfigCard
-
--- Toggle Auto Plant Hero Button
-local TogglePlantBtn = Instance.new("TextButton")
-TogglePlantBtn.Name = "TogglePlantBtn"
-TogglePlantBtn.Size = UDim2.new(1, 0, 0, 42)
-TogglePlantBtn.Position = UDim2.new(0, 0, 1, -44)
-TogglePlantBtn.BackgroundColor3 = Color3.fromRGB(225, 29, 72)
-TogglePlantBtn.BorderSizePixel = 0
-TogglePlantBtn.Font = Enum.Font.GothamBold
-TogglePlantBtn.Text = "▶  START AUTO PLANT"
-TogglePlantBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-TogglePlantBtn.TextSize = 11
-TogglePlantBtn.AutoButtonColor = false
-TogglePlantBtn.Parent = PlantPage
-Instance.new("UICorner", TogglePlantBtn).CornerRadius = UDim.new(0, 10)
-
-local PlantBtnGrad = Instance.new("UIGradient", TogglePlantBtn)
-PlantBtnGrad.Rotation = 45
-PlantBtnGrad.Color = ColorSequence.new({
-    ColorSequenceKeypoint.new(0, Color3.fromRGB(244, 63, 94)),
-    ColorSequenceKeypoint.new(1, Color3.fromRGB(225, 29, 72))
-})
-
--- ========================================================
--- TAB 2: AUTO CLEAN PAGE
--- ========================================================
-local CleanPage = Instance.new("Frame")
-CleanPage.Name = "CleanPage"
-CleanPage.Size = UDim2.new(1, 0, 1, 0)
-CleanPage.BackgroundTransparency = 1
-CleanPage.Visible = false
-CleanPage.Parent = ContentFrame
-
--- Card 1: Clean Status & Room
-local CleanStatusCard = createModernCard(CleanPage, 48, 0)
-
-local CleanCardIcon = Instance.new("TextLabel")
-CleanCardIcon.Size = UDim2.new(0, 24, 0, 24)
-CleanCardIcon.Position = UDim2.new(0, 12, 0.5, -12)
-CleanCardIcon.BackgroundTransparency = 1
-CleanCardIcon.Font = Enum.Font.GothamBold
-CleanCardIcon.Text = "🧹"
-CleanCardIcon.TextSize = 16
-CleanCardIcon.Parent = CleanStatusCard
-
-local CleanOwnerLabel = Instance.new("TextLabel")
-CleanOwnerLabel.Size = UDim2.new(1, -120, 0, 16)
-CleanOwnerLabel.Position = UDim2.new(0, 42, 0, 8)
-CleanOwnerLabel.BackgroundTransparency = 1
-CleanOwnerLabel.Font = Enum.Font.GothamBold
-CleanOwnerLabel.Text = string.format("Owner: %s | Room: %s", CleanState.KosanOwner, CleanState.RoomNumber)
-CleanOwnerLabel.TextColor3 = Color3.fromRGB(240, 240, 250)
-CleanOwnerLabel.TextSize = 11
-CleanOwnerLabel.TextXAlignment = Enum.TextXAlignment.Left
-CleanOwnerLabel.Parent = CleanStatusCard
-
-local CleanSubStatus = Instance.new("TextLabel")
-CleanSubStatus.Size = UDim2.new(1, -120, 0, 14)
-CleanSubStatus.Position = UDim2.new(0, 42, 0, 25)
-CleanSubStatus.BackgroundTransparency = 1
-CleanSubStatus.Font = Enum.Font.Gotham
-CleanSubStatus.Text = "Target: Objek Kotoran (Plastic)"
-CleanSubStatus.TextColor3 = Color3.fromRGB(140, 145, 165)
-CleanSubStatus.TextSize = 10
-CleanSubStatus.TextXAlignment = Enum.TextXAlignment.Left
-CleanSubStatus.Parent = CleanStatusCard
-
-local CleanStatusBadge = Instance.new("Frame")
-CleanStatusBadge.Size = UDim2.new(0, 68, 0, 22)
-CleanStatusBadge.Position = UDim2.new(1, -78, 0.5, -11)
-CleanStatusBadge.BackgroundColor3 = Color3.fromRGB(30, 33, 46)
-CleanStatusBadge.BorderSizePixel = 0
-CleanStatusBadge.Parent = CleanStatusCard
-Instance.new("UICorner", CleanStatusBadge).CornerRadius = UDim.new(0, 6)
-
-local CleanBadgeText = Instance.new("TextLabel")
-CleanBadgeText.Size = UDim2.new(1, 0, 1, 0)
-CleanBadgeText.BackgroundTransparency = 1
-CleanBadgeText.Font = Enum.Font.GothamBold
-CleanBadgeText.Text = "● IDLE"
-CleanBadgeText.TextColor3 = Color3.fromRGB(160, 165, 185)
-CleanBadgeText.TextSize = 9
-CleanBadgeText.Parent = CleanStatusBadge
-
--- Card 2: Modern Inputs Container
-local InputsCard = createModernCard(CleanPage, 126, 54)
-
-local function createCyberInput(name, placeholder, defaultValue, labelText, posY)
-    local lbl = Instance.new("TextLabel")
-    lbl.Size = UDim2.new(1, -24, 0, 12)
-    lbl.Position = UDim2.new(0, 12, 0, posY)
-    lbl.BackgroundTransparency = 1
-    lbl.Font = Enum.Font.GothamBold
-    lbl.Text = labelText
-    lbl.TextColor3 = Color3.fromRGB(99, 102, 241)
-    lbl.TextSize = 8
-    lbl.TextXAlignment = Enum.TextXAlignment.Left
-    lbl.Parent = InputsCard
-
-    local box = Instance.new("TextBox")
-    box.Name = name
-    box.Size = UDim2.new(1, -24, 0, 24)
-    box.Position = UDim2.new(0, 12, 0, posY + 14)
-    box.BackgroundColor3 = Color3.fromRGB(15, 16, 24)
-    box.BorderSizePixel = 0
-    box.TextColor3 = Color3.fromRGB(240, 240, 250)
-    box.Text = tostring(defaultValue)
-    box.PlaceholderText = placeholder
-    box.PlaceholderColor3 = Color3.fromRGB(100, 105, 125)
-    box.Font = Enum.Font.Gotham
-    box.TextSize = 10
-    box.ClearTextOnFocus = false
-    box.Parent = InputsCard
-    Instance.new("UICorner", box).CornerRadius = UDim.new(0, 5)
-    local bStroke = Instance.new("UIStroke", box)
-    bStroke.Color = Color3.fromRGB(42, 46, 66)
-    bStroke.Thickness = 1
-
-    box.Focused:Connect(function()
-        TweenService:Create(bStroke, TWEEN_FAST, { Color = Color3.fromRGB(99, 102, 241) }):Play()
-    end)
-    box.FocusLost:Connect(function()
-        TweenService:Create(bStroke, TWEEN_FAST, { Color = Color3.fromRGB(42, 46, 66) }):Play()
-    end)
-
-    return box
-end
-
-local IdInput     = createCyberInput("IdInput", "Contoh: UserID_RoomID", CleanState.CurrentKosanID, "ID KOSAN (USERID_ROOMID):", 6)
-local RadiusInput = createCyberInput("RadiusInput", "Jarak deteksi studs", CleanState.Radius, "RADIUS DETEKSI (STUDS):", 46)
-local LoopInput   = createCyberInput("LoopInput", "Delay loop detik", CleanState.LoopInterval, "LOOP INTERVAL (DETIK):", 86)
-
--- Toggle Auto Clean Hero Button
-local ToggleCleanBtn = Instance.new("TextButton")
-ToggleCleanBtn.Name = "ToggleCleanBtn"
-ToggleCleanBtn.Size = UDim2.new(1, 0, 0, 42)
-ToggleCleanBtn.Position = UDim2.new(0, 0, 1, -44)
-ToggleCleanBtn.BackgroundColor3 = Color3.fromRGB(225, 29, 72)
-ToggleCleanBtn.BorderSizePixel = 0
-ToggleCleanBtn.Font = Enum.Font.GothamBold
-ToggleCleanBtn.Text = "▶  START AUTO CLEAN"
-ToggleCleanBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-ToggleCleanBtn.TextSize = 11
-ToggleCleanBtn.AutoButtonColor = false
-ToggleCleanBtn.Parent = CleanPage
-Instance.new("UICorner", ToggleCleanBtn).CornerRadius = UDim.new(0, 10)
-
-local CleanBtnGrad = Instance.new("UIGradient", ToggleCleanBtn)
-CleanBtnGrad.Rotation = 45
-CleanBtnGrad.Color = ColorSequence.new({
-    ColorSequenceKeypoint.new(0, Color3.fromRGB(244, 63, 94)),
-    ColorSequenceKeypoint.new(1, Color3.fromRGB(225, 29, 72))
-})
-
--- ========================================================
--- FOOTER BAR (CREDIT: SMITH GANTENG)
--- ========================================================
-local Footer = Instance.new("Frame")
-Footer.Name = "Footer"
-Footer.Size = UDim2.new(1, 0, 0, 22)
-Footer.Position = UDim2.new(0, 0, 1, -22)
-Footer.BackgroundColor3 = Color3.fromRGB(18, 20, 28)
-Footer.BorderSizePixel = 0
-Footer.Parent = MainFrame
-
-local FooterStroke = Instance.new("UIStroke", Footer)
-FooterStroke.Color = Color3.fromRGB(32, 35, 50)
-FooterStroke.Thickness = 1
-
-local FooterLabel = Instance.new("TextLabel")
-FooterLabel.Size = UDim2.new(1, 0, 1, 0)
-FooterLabel.BackgroundTransparency = 1
-FooterLabel.Font = Enum.Font.GothamBold
-FooterLabel.Text = "✨ smith ganteng ✨"
-FooterLabel.TextColor3 = Color3.fromRGB(251, 191, 36)
-FooterLabel.TextSize = 10
-FooterLabel.Parent = Footer
-
--- ========================================================
--- TAB SWITCHING ANIMATION
--- ========================================================
-local function switchTab(tab)
-    if tab == "Plant" then
-        PlantPage.Visible = true
-        CleanPage.Visible = false
-
-        TweenService:Create(TabPlantBtn, TWEEN_SMOOTH, {
-            BackgroundColor3 = Color3.fromRGB(38, 42, 62),
-            TextColor3 = Color3.fromRGB(255, 255, 255)
-        }):Play()
-
-        TweenService:Create(TabCleanBtn, TWEEN_SMOOTH, {
-            BackgroundColor3 = Color3.fromRGB(20, 22, 32),
-            TextColor3 = Color3.fromRGB(130, 135, 155)
-        }):Play()
-    elseif tab == "Clean" then
-        PlantPage.Visible = false
-        CleanPage.Visible = true
-
-        TweenService:Create(TabCleanBtn, TWEEN_SMOOTH, {
-            BackgroundColor3 = Color3.fromRGB(38, 42, 62),
-            TextColor3 = Color3.fromRGB(255, 255, 255)
-        }):Play()
-
-        TweenService:Create(TabPlantBtn, TWEEN_SMOOTH, {
-            BackgroundColor3 = Color3.fromRGB(20, 22, 32),
-            TextColor3 = Color3.fromRGB(130, 135, 155)
-        }):Play()
-    end
-end
-
--- Default active tab
-switchTab("Plant")
-
-table.insert(Connections, TabPlantBtn.MouseButton1Click:Connect(function() switchTab("Plant") end))
-table.insert(Connections, TabCleanBtn.MouseButton1Click:Connect(function() switchTab("Clean") end))
-
--- ========================================================
--- LOGIC HANDLERS & ANIMATIONS
--- ========================================================
-
--- Update Lahan Stepper UI
-local function updateLahanDisplay()
-    local name = LAHAN_CATEGORIES[currentLahanIndex]
-    local plots = LAHAN_PRESETS[name] or {}
-    LahanDisplayBtn.Text = "📍 " .. name .. " (" .. #plots .. " Plots)"
-    PlantSubStatus.Text = string.format("Plot Terpilih: %d Titik Koordinat", #plots)
-end
-
-table.insert(Connections, PrevLahanBtn.MouseButton1Click:Connect(function()
-    currentLahanIndex = currentLahanIndex - 1
-    if currentLahanIndex < 1 then currentLahanIndex = #LAHAN_CATEGORIES end
-    updateLahanDisplay()
-end))
-
-table.insert(Connections, NextLahanBtn.MouseButton1Click:Connect(function()
-    currentLahanIndex = currentLahanIndex + 1
-    if currentLahanIndex > #LAHAN_CATEGORIES then currentLahanIndex = 1 end
-    updateLahanDisplay()
-end))
-
-table.insert(Connections, LahanDisplayBtn.MouseButton1Click:Connect(function()
-    currentLahanIndex = currentLahanIndex + 1
-    if currentLahanIndex > #LAHAN_CATEGORIES then currentLahanIndex = 1 end
-    updateLahanDisplay()
-end))
-
--- Input Listeners for Clean
-table.insert(Connections, IdInput.FocusLost:Connect(function()
-    CleanState.CurrentKosanID = IdInput.Text
-    local o, r = parseKosanID(IdInput.Text)
-    CleanState.KosanOwner, CleanState.RoomNumber = o, r
-    CleanOwnerLabel.Text = string.format("Owner: %s | Room: %s", o, r)
-end))
-
-table.insert(Connections, RadiusInput.FocusLost:Connect(function()
-    local val = tonumber(RadiusInput.Text)
-    CleanState.Radius = (val and val > 0) and val or CleanConfig.DefaultRadius
-    RadiusInput.Text = tostring(CleanState.Radius)
-end))
-
-table.insert(Connections, LoopInput.FocusLost:Connect(function()
-    local val = tonumber(LoopInput.Text)
-    CleanState.LoopInterval = (val and val >= CleanConfig.MinLoopInterval) and val or CleanConfig.DefaultLoop
-    LoopInput.Text = tostring(CleanState.LoopInterval)
-end))
-
--- Toggle Plant Button Logic
-table.insert(Connections, TogglePlantBtn.MouseButton1Click:Connect(function()
-    isPlantRunning = not isPlantRunning
-
-    if isPlantRunning then
-        PlantBtnGrad.Color = ColorSequence.new({
-            ColorSequenceKeypoint.new(0, Color3.fromRGB(52, 211, 153)),
-            ColorSequenceKeypoint.new(1, Color3.fromRGB(16, 185, 129))
-        })
-        TogglePlantBtn.Text = "■  STOP AUTO PLANT (RUNNING)"
-        PlantBadgeText.Text = "● ACTIVE"
-        PlantBadgeText.TextColor3 = Color3.fromRGB(52, 211, 153)
-        PlantStatusBadge.BackgroundColor3 = Color3.fromRGB(20, 45, 35)
-        startPlantingLoop()
-    else
-        PlantBtnGrad.Color = ColorSequence.new({
-            ColorSequenceKeypoint.new(0, Color3.fromRGB(244, 63, 94)),
-            ColorSequenceKeypoint.new(1, Color3.fromRGB(225, 29, 72))
-        })
-        TogglePlantBtn.Text = "▶  START AUTO PLANT"
-        PlantBadgeText.Text = "● IDLE"
-        PlantBadgeText.TextColor3 = Color3.fromRGB(160, 165, 185)
-        PlantStatusBadge.BackgroundColor3 = Color3.fromRGB(30, 33, 46)
-        stopPlantingLoop()
-    end
-end))
-
--- Toggle Clean Button Logic
-table.insert(Connections, ToggleCleanBtn.MouseButton1Click:Connect(function()
-    isCleanRunning = not isCleanRunning
-
-    if isCleanRunning then
-        CleanBtnGrad.Color = ColorSequence.new({
-            ColorSequenceKeypoint.new(0, Color3.fromRGB(52, 211, 153)),
-            ColorSequenceKeypoint.new(1, Color3.fromRGB(16, 185, 129))
-        })
-        ToggleCleanBtn.Text = "■  STOP AUTO CLEAN (RUNNING)"
-        CleanBadgeText.Text = "● ACTIVE"
-        CleanBadgeText.TextColor3 = Color3.fromRGB(52, 211, 153)
-        CleanStatusBadge.BackgroundColor3 = Color3.fromRGB(20, 45, 35)
-        startCleaningLoop()
-    else
-        CleanBtnGrad.Color = ColorSequence.new({
-            ColorSequenceKeypoint.new(0, Color3.fromRGB(244, 63, 94)),
-            ColorSequenceKeypoint.new(1, Color3.fromRGB(225, 29, 72))
-        })
-        ToggleCleanBtn.Text = "▶  START AUTO CLEAN"
-        CleanBadgeText.Text = "● IDLE"
-        CleanBadgeText.TextColor3 = Color3.fromRGB(160, 165, 185)
-        CleanStatusBadge.BackgroundColor3 = Color3.fromRGB(30, 33, 46)
-        stopCleaningLoop()
-    end
-end))
-
--- Minimize & Restore Window Animation
-local isMinimized = false
-table.insert(Connections, MiniBtn.MouseButton1Click:Connect(function()
-    isMinimized = not isMinimized
-    local targetHeight = isMinimized and MINI_HEIGHT or WIN_HEIGHT
-
-    TabBar.Visible = not isMinimized
-    ContentFrame.Visible = not isMinimized
-    Footer.Visible = not isMinimized
-    MiniBtn.Text = isMinimized and "+" or "—"
-
-    TweenService:Create(MainFrame, TWEEN_SMOOTH, {
-        Size = UDim2.new(0, WIN_WIDTH, 0, targetHeight)
-    }):Play()
-end))
-
--- Close & Complete Cleanup
-table.insert(Connections, CloseBtn.MouseButton1Click:Connect(function()
-    isScriptRunning = false
-    stopPlantingLoop()
-    stopCleaningLoop()
-
-    for _, conn in ipairs(Connections) do
-        if conn and conn.Disconnect then conn:Disconnect() end
-    end
-    table.clear(Connections)
-
-    ScreenGui:Destroy()
-end))
+ScreenGui.Parent = parentGui
+
+local Main = Instance.new("Frame")
+Main.Name = "Main"
+Main.Size = UDim2.new(0, 300, 0, 250)
+Main.Position = UDim2.new(0.5, -150, 0.5, -125)
+Main.BackgroundColor3 = Color3.fromRGB(28, 28, 32)
+Main.BorderSizePixel = 0
+Main.Active = true
+Main.Draggable = true
+Main.Parent = ScreenGui
+
+Instance.new("UICorner", Main).CornerRadius = UDim.new(0, 10)
+local stroke = Instance.new("UIStroke", Main)
+stroke.Color = Color3.fromRGB(0, 200, 120)
+stroke.Thickness = 1.5
+
+-- ============================================================
+-- TITLE BAR (selalu tampil,
