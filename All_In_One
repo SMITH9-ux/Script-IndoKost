@@ -1,12 +1,16 @@
 
-
 -- SERVICES
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local TweenService = game:GetService("TweenService")
-local CoreGui = game:GetService("CoreGui")
-local VirtualUser = game:GetService("VirtualUser")
+local UserInputService = game:GetService("UserInputService")
+
+local okCoreGui, CoreGui = pcall(function() return game:GetService("CoreGui") end)
+if not okCoreGui then CoreGui = nil end
+
+local okVirtualUser, VirtualUser = pcall(function() return game:GetService("VirtualUser") end)
+if not okVirtualUser then VirtualUser = nil end
 
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
@@ -227,6 +231,41 @@ local function safeTeleport(targetPos: Vector3)
         hrp.CFrame = CFrame.new(targetPos + Vector3.new(0, 3, 0))
     end
 end
+
+-- ========================================================
+-- COMPAT LAYER (MULTI-EXECUTOR)
+-- ========================================================
+-- Menekan ProximityPrompt: pakai fireproximityprompt bila ada,
+-- jika tidak ada pakai simulasi tahan tombol (InputHoldBegin/End)
+local function firePrompt(prompt)
+    if typeof(fireproximityprompt) == "function" then
+        local ok = pcall(fireproximityprompt, prompt)
+        if ok then return true end
+    end
+
+    local ok = pcall(function()
+        prompt:InputHoldBegin()
+        task.wait((prompt.HoldDuration or 0) + 0.05)
+        prompt:InputHoldEnd()
+    end)
+    return ok
+end
+
+local function getExecutorName()
+    if typeof(identifyexecutor) == "function" then
+        local ok, name, version = pcall(identifyexecutor)
+        if ok and name then
+            return tostring(name) .. (version and (" " .. tostring(version)) or "")
+        end
+    end
+    return "Unknown"
+end
+
+print(string.format("[IndoKost] Executor: %s | fireproximityprompt: %s | firesignal: %s | gethui: %s",
+    getExecutorName(),
+    typeof(fireproximityprompt) == "function" and "ya" or "fallback",
+    typeof(firesignal) == "function" and "ya" or "fallback",
+    typeof(gethui) == "function" and "ya" or "CoreGui/PlayerGui"))
 
 -- ========================================================
 -- NETWORK RESOLVERS
@@ -514,16 +553,11 @@ local function trashStep(isDispose)
         end
     end
 
-    if typeof(fireproximityprompt) ~= "function" then
-        warn("[AutoSampah]: fireproximityprompt tidak tersedia di executor ini")
-        return "nofire"
-    end
-
     local ok = pcall(function()
         prompt.RequiresLineOfSight = false
         prompt.MaxActivationDistance = 999999
         prompt.HoldDuration = 0
-        fireproximityprompt(prompt)
+        if not firePrompt(prompt) then error("firePrompt gagal") end
     end)
 
     if not ok then return "nofire" end
@@ -621,8 +655,8 @@ local function cleanDirtStep(target)
         prompt.RequiresLineOfSight = false
         prompt.MaxActivationDistance = 999999
         prompt.HoldDuration = 0
-        if prompt.Enabled and typeof(fireproximityprompt) == "function" then
-            fireproximityprompt(prompt)
+        if prompt.Enabled then
+            pcall(firePrompt, prompt)
         end
     end
 end
@@ -867,10 +901,20 @@ local antiAfkThread = nil
 local ANTI_AFK_INTERVAL = 55 -- detik, sinyal cadangan berkala
 
 local function antiAfkPulse()
-    pcall(function()
+    local ok = pcall(function()
         VirtualUser:CaptureController()
         VirtualUser:ClickButton2(Vector2.new(0, 0))
     end)
+
+    if not ok then
+        -- Cadangan bila VirtualUser tidak tersedia di executor
+        pcall(function()
+            local vim = game:GetService("VirtualInputManager")
+            vim:SendMouseButtonEvent(0, 0, 1, true, game, 0)
+            task.wait(0.05)
+            vim:SendMouseButtonEvent(0, 0, 1, false, game, 0)
+        end)
+    end
 end
 
 local function startAntiAfk()
@@ -911,14 +955,44 @@ local MINI_HEIGHT = 46
 local TWEEN_SMOOTH = TweenInfo.new(0.25, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
 local TWEEN_FAST   = TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
 
+-- Matikan instance lama bila script dijalankan ulang
+do
+    local genv = (typeof(getgenv) == "function" and getgenv()) or _G
+    if genv.__IndoKostShutdown then
+        pcall(genv.__IndoKostShutdown)
+        genv.__IndoKostShutdown = nil
+    end
+end
+
 local ScreenGui = Instance.new("ScreenGui")
 ScreenGui.Name = "IndoKostUltraHub"
 ScreenGui.ResetOnSpawn = false
 ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 
-local pcallGui = pcall(function() ScreenGui.Parent = CoreGui end)
-if not pcallGui or not ScreenGui.Parent then
-    ScreenGui.Parent = PlayerGui
+-- Pasang GUI: gethui > CoreGui > PlayerGui (otomatis pilih yang tersedia)
+do
+    if syn and typeof(syn.protect_gui) == "function" then
+        pcall(syn.protect_gui, ScreenGui)
+    end
+
+    local mounted = false
+
+    if typeof(gethui) == "function" then
+        local okHui, hui = pcall(gethui)
+        if okHui and hui then
+            pcall(function() ScreenGui.Parent = hui end)
+            mounted = ScreenGui.Parent ~= nil
+        end
+    end
+
+    if not mounted and CoreGui then
+        pcall(function() ScreenGui.Parent = CoreGui end)
+        mounted = ScreenGui.Parent ~= nil
+    end
+
+    if not mounted then
+        ScreenGui.Parent = PlayerGui
+    end
 end
 
 -- Main Window
@@ -930,7 +1004,6 @@ MainFrame.BackgroundColor3 = Color3.fromRGB(15, 17, 24)
 MainFrame.BorderSizePixel = 0
 MainFrame.ClipsDescendants = true
 MainFrame.Active = true
-MainFrame.Draggable = true
 MainFrame.Parent = ScreenGui
 
 local MainCorner = Instance.new("UICorner", MainFrame)
@@ -1972,18 +2045,65 @@ table.insert(Connections, MiniBtn.Activated:Connect(function()
     }):Play()
 end))
 
+-- Drag window manual (support mouse & touch di semua executor)
+do
+    local dragging = false
+    local dragInput, dragStart, startPos
+
+    table.insert(Connections, Header.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = MainFrame.Position
+
+            local endConn
+            endConn = input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                    if endConn then endConn:Disconnect() end
+                end
+            end)
+        end
+    end))
+
+    table.insert(Connections, Header.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragInput = input
+        end
+    end))
+
+    table.insert(Connections, UserInputService.InputChanged:Connect(function(input)
+        if dragging and input == dragInput and dragStart then
+            local delta = input.Position - dragStart
+            MainFrame.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y
+            )
+        end
+    end))
+end
+
 -- Close & Complete Cleanup
-table.insert(Connections, CloseBtn.Activated:Connect(function()
+local function shutdown()
     isScriptRunning = false
-    stopPlantingLoop()
-    stopCleaningLoop()
-    stopTenantWorker()
-    stopAntiAfk()
+    pcall(stopPlantingLoop)
+    pcall(stopCleaningLoop)
+    pcall(stopTenantWorker)
+    pcall(stopAntiAfk)
 
     for _, conn in ipairs(Connections) do
-        if conn and conn.Disconnect then conn:Disconnect() end
+        if conn and conn.Disconnect then pcall(function() conn:Disconnect() end) end
     end
     table.clear(Connections)
 
-    ScreenGui:Destroy()
-end))
+    pcall(function() ScreenGui:Destroy() end)
+end
+
+table.insert(Connections, CloseBtn.Activated:Connect(shutdown))
+
+do
+    local genv = (typeof(getgenv) == "function" and getgenv()) or _G
+    genv.__IndoKostShutdown = shutdown
+end
