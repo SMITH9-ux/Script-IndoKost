@@ -8,7 +8,7 @@
     ║  - Anti-AFK: Cegah Kick Idle 20 Menit (Tombol Terpisah)       ║
     ║  - Alur Clean: Bersih > Tunggu Sampah > Ambil > Buang         ║
     ║  - Kompatibel multi-executor (fallback otomatis)              ║
-    ║  - Auto Acc Penyewa + Spin Gratis tiap 10 (Tombol Terpisah)   ║
+    ║  - Auto Acc Penyewa + Spin Gratis saat 10 Penyewa (Terpisah)  ║
     ║  - High-End Glassmorphism UI with UIGradient & Micro-Tweens   ║
     ╚═══════════════════════════════════════════════════════════════╝
 --]]
@@ -41,7 +41,8 @@ local PlantConfig = {
     BUY_COUNT = 100,
     INTER_ACTION_DELAY = 0.15,
     CYCLE_COOLDOWN = 0.10,
-    DEFAULT_LAHAN = "Semua Lahan"
+    DEFAULT_LAHAN = "Semua Lahan",
+    PLOT4_RADIUS = 1000 -- radius (studs) auto plant khusus Plot 4; plot di luar radius dilewati
 }
 
 local LAHAN_LIST = {
@@ -610,6 +611,27 @@ local function executePlantCycle()
     local activePlots = getActivePlots()
     if #activePlots == 0 then return end
 
+    -- Radius khusus Plot 4: hanya tanam plot yang berjarak <= PLOT4_RADIUS dari karakter
+    local lahanName = LAHAN_CATEGORIES[currentLahanIndex] or ""
+    if string.sub(lahanName, 1, 6) == "Plot 4" then
+        local char = LocalPlayer.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if hrp then
+            local inRange = {}
+            for _, plotPos in ipairs(activePlots) do
+                if (plotPos - hrp.Position).Magnitude <= PlantConfig.PLOT4_RADIUS then
+                    table.insert(inRange, plotPos)
+                end
+            end
+            activePlots = inRange
+        end
+
+        if #activePlots == 0 then
+            task.wait(1) -- tidak ada plot dalam radius, cek lagi sebentar
+            return
+        end
+    end
+
     if beliBibitRF then
         local buySuccess, buyErr = pcall(function()
             return beliBibitRF:InvokeServer(PlantConfig.CROP_NAME, PlantConfig.BUY_COUNT)
@@ -792,8 +814,11 @@ end
 -- AUTO ACC PENYEWA
 -- ========================================================
 local TenantConfig = {
-    Interval = 1,   -- detik antar permintaan terima penyewa
-    SpinEvery = 10  -- spin gratis setiap N penyewa yang diterima
+    Interval = 1,          -- detik antar permintaan terima penyewa
+    SpinAt = 10,           -- spin gratis saat jumlah penyewa mencapai angka ini
+    SpinPollInterval = 2,  -- detik antar pengecekan jumlah penyewa
+    -- Kata kunci untuk mencari jumlah penyewa di UI / attribute (huruf kecil)
+    TenantKeywords = { "penyewa", "tenant" }
 }
 
 local TenantState = {
@@ -801,9 +826,11 @@ local TenantState = {
     CallCount = 0,
     AcceptCount = 0,
     SpinEnabled = false,
-    SpinBaseline = 0, -- jumlah penyewa yang sudah "dibayar" dengan spin
+    SpinArmed = true,      -- siap spin; aktif lagi setelah jumlah penyewa turun di bawah SpinAt
+    SpinBaseline = 0,      -- cadangan: jumlah penyewa diterima yang sudah dipakai untuk spin
     SpinCount = 0,
-    SpinBusy = false
+    DetectedTenants = nil, -- jumlah penyewa terdeteksi
+    DetectSource = "-"
 }
 
 local tenantRF = nil
@@ -841,33 +868,132 @@ local function getSpinRemote()
     return spinRF
 end
 
--- Spin gratis tiap TenantConfig.SpinEvery penyewa diterima
-local function checkAutoSpin()
-    if not TenantState.SpinEnabled or TenantState.SpinBusy then return end
-    if TenantState.AcceptCount - TenantState.SpinBaseline < TenantConfig.SpinEvery then return end
+-- Deteksi jumlah penyewa saat ini.
+-- Return: jumlah (angka), sumber ("UI" / "Attr"), atau nil bila tidak ditemukan
+local function readTenantCount()
+    -- 1) UI: teks seperti "Penyewa: 10/10" atau "Penyewa 10"
+    for _, obj in ipairs(PlayerGui:GetDescendants()) do
+        if (obj:IsA("TextLabel") or obj:IsA("TextButton")) and obj.Text ~= "" and guiShown(obj) then
+            local text = string.lower(obj.Text)
 
-    TenantState.SpinBusy = true
-    task.spawn(function()
-        local rf = getSpinRemote()
-        if rf then
-            local ok, result = pcall(function()
-                return rf:InvokeServer()
-            end)
-            if ok then
-                TenantState.SpinCount += 1
-            else
-                warn("[AutoSpin Error]:", result)
+            local parts = { text, string.lower(obj.Name) }
+            local inst = obj.Parent
+            for _ = 1, 3 do
+                if not inst or inst == PlayerGui then break end
+                table.insert(parts, string.lower(inst.Name))
+                inst = inst.Parent
             end
-        else
-            warn("[AutoSpin]: Remote GachaService.SpinX10WithFree tidak ditemukan")
-        end
 
-        -- Maju ke kelipatan berikutnya (juga bila gagal, agar tidak spam)
-        TenantState.SpinBaseline += TenantConfig.SpinEvery
-        TenantState.SpinBusy = false
-        onTenantUpdate()
-        checkAutoSpin() -- kejar spin yang tertunda
+            if hasKeyword(table.concat(parts, " "), TenantConfig.TenantKeywords) then
+                -- Format "x/y" (mis. 10/10)
+                local cur = string.match(text, "(%d+)%s*/%s*%d+")
+                if cur then return tonumber(cur), "UI" end
+
+                -- Format "penyewa: 10"
+                for _, kw in ipairs(TenantConfig.TenantKeywords) do
+                    local n = string.match(text, kw .. "%D*(%d+)")
+                    if n then return tonumber(n), "UI" end
+                end
+            end
+        end
+    end
+
+    -- 2) Attribute pemain
+    local okAttr, attrs = pcall(function() return LocalPlayer:GetAttributes() end)
+    if okAttr and attrs then
+        for name, value in pairs(attrs) do
+            if type(value) == "number" and hasKeyword(string.lower(name), TenantConfig.TenantKeywords) then
+                return value, "Attr"
+            end
+        end
+    end
+
+    -- 3) leaderstats / Value di dalam pemain
+    for _, child in ipairs(LocalPlayer:GetDescendants()) do
+        if (child:IsA("NumberValue") or child:IsA("IntValue"))
+            and hasKeyword(string.lower(child.Name), TenantConfig.TenantKeywords) then
+            return child.Value, "Value"
+        end
+    end
+
+    return nil, "-"
+end
+
+local spinRF = nil
+local function getSpinRemote()
+    if spinRF and spinRF.Parent then return spinRF end
+    pcall(function()
+        spinRF = ReplicatedStorage
+            :WaitForChild("NKSystem", 5)
+            :WaitForChild("Packages", 5)
+            :WaitForChild("Knit", 5)
+            :WaitForChild("Services", 5)
+            :WaitForChild("GachaService", 5)
+            :WaitForChild("RF", 5)
+            :WaitForChild("SpinX10WithFree", 5)
     end)
+    return spinRF
+end
+
+local function doSpin()
+    local rf = getSpinRemote()
+    if not rf then
+        warn("[AutoSpin]: Remote GachaService.SpinX10WithFree tidak ditemukan")
+        return false
+    end
+
+    local ok, result = pcall(function()
+        return rf:InvokeServer()
+    end)
+    if ok then
+        TenantState.SpinCount += 1
+    else
+        warn("[AutoSpin Error]:", result)
+    end
+    return ok
+end
+
+-- Watcher: spin gacha otomatis saat penyewa sudah 10
+local spinWatcher = nil
+
+local function startSpinWatcher()
+    if spinWatcher then return end
+    spinWatcher = task.spawn(function()
+        while TenantState.SpinEnabled and isScriptRunning do
+            local count, source = readTenantCount()
+            TenantState.DetectedTenants = count
+            TenantState.DetectSource = source
+
+            if count ~= nil then
+                if count >= TenantConfig.SpinAt then
+                    if TenantState.SpinArmed then
+                        TenantState.SpinArmed = false -- cegah spin berulang selama penyewa masih >= 10
+                        doSpin()
+                    end
+                else
+                    TenantState.SpinArmed = true -- penyewa turun: siap spin lagi saat mencapai 10
+                end
+            else
+                -- Cadangan: jumlah penyewa tidak terbaca -> hitung dari yang diterima script
+                if TenantState.AcceptCount - TenantState.SpinBaseline >= TenantConfig.SpinAt then
+                    TenantState.SpinBaseline += TenantConfig.SpinAt
+                    doSpin()
+                end
+            end
+
+            onTenantUpdate()
+            task.wait(TenantConfig.SpinPollInterval)
+        end
+        spinWatcher = nil
+    end)
+end
+
+local function stopSpinWatcher()
+    TenantState.SpinEnabled = false
+    if spinWatcher then
+        task.cancel(spinWatcher)
+        spinWatcher = nil
+    end
 end
 
 local function startTenantWorker()
@@ -883,7 +1009,6 @@ local function startTenantWorker()
                     TenantState.CallCount += 1
                     if result == true then
                         TenantState.AcceptCount += 1
-                        checkAutoSpin()
                     end
                     onTenantUpdate()
                 else
@@ -962,8 +1087,10 @@ end
 -- ========================================================
 -- HIGH-END CYBER GUI DESIGN (SMITH GANTENG)
 -- ========================================================
-local WIN_WIDTH = 340
-local WIN_HEIGHT = 445
+-- Ukuran GUI sedang (menyesuaikan layar, tidak lebih kecil dari 340x445)
+local viewport = (Workspace.CurrentCamera and Workspace.CurrentCamera.ViewportSize) or Vector2.new(1280, 720)
+local WIN_WIDTH = math.clamp(400, 340, math.max(340, viewport.X - 20))
+local WIN_HEIGHT = math.clamp(500, 445, math.max(445, viewport.Y - 40))
 local MINI_HEIGHT = 46
 
 local TWEEN_SMOOTH = TweenInfo.new(0.25, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
@@ -1348,7 +1475,7 @@ ConfigInfoLabel.Size = UDim2.new(1, -24, 1, 0)
 ConfigInfoLabel.Position = UDim2.new(0, 12, 0, 0)
 ConfigInfoLabel.BackgroundTransparency = 1
 ConfigInfoLabel.Font = Enum.Font.GothamMedium
-ConfigInfoLabel.Text = string.format("⚡ Beli: %d | Delay: %.2fs | Cooldown: %.2fs", PlantConfig.BUY_COUNT, PlantConfig.INTER_ACTION_DELAY, PlantConfig.CYCLE_COOLDOWN)
+ConfigInfoLabel.Text = string.format("⚡ Beli: %d | Delay: %.2fs | Cooldown: %.2fs | R4: %d", PlantConfig.BUY_COUNT, PlantConfig.INTER_ACTION_DELAY, PlantConfig.CYCLE_COOLDOWN, PlantConfig.PLOT4_RADIUS)
 ConfigInfoLabel.TextColor3 = Color3.fromRGB(150, 155, 175)
 ConfigInfoLabel.TextSize = 9
 ConfigInfoLabel.TextXAlignment = Enum.TextXAlignment.Center
@@ -1787,17 +1914,23 @@ do
     info.Position = UDim2.new(0, 12, 0, 0)
     info.BackgroundTransparency = 1
     info.Font = Enum.Font.GothamMedium
-    info.Text = "Acc penyewa & Spin Gratis punya tombol sendiri. Spin otomatis tiap 10 penyewa diterima."
+    info.Text = "Penyewa: belum terdeteksi\nSpin otomatis saat penyewa sudah 10"
     info.TextColor3 = Color3.fromRGB(150, 155, 175)
     info.TextSize = 9
     info.TextWrapped = true
     info.Parent = infoCard
 
     local toggleBtn, toggleGrad = createHeroToggle(TenantPage, "ToggleTenantBtn", "▶  START AUTO ACC PENYEWA", -92)
-    local spinBtn, spinGrad = createHeroToggle(TenantPage, "ToggleSpinBtn", "▶  START AUTO SPIN GRATIS (TIAP 10)", -44)
+    local spinBtn, spinGrad = createHeroToggle(TenantPage, "ToggleSpinBtn", "▶  START AUTO SPIN (SAAT 10 PENYEWA)", -44)
 
     onTenantUpdate = function()
         sub.Text = string.format("Diterima: %d | Req: %d | Spin: %d", TenantState.AcceptCount, TenantState.CallCount, TenantState.SpinCount)
+        if TenantState.DetectedTenants ~= nil then
+            info.Text = string.format("Penyewa: %d/%d (%s)\nSpin otomatis saat penyewa sudah %d",
+                TenantState.DetectedTenants, TenantConfig.SpinAt, TenantState.DetectSource, TenantConfig.SpinAt)
+        else
+            info.Text = string.format("Penyewa: belum terdeteksi (hitung dari diterima)\nSpin otomatis tiap %d penyewa", TenantConfig.SpinAt)
+        end
     end
 
     table.insert(Connections, toggleBtn.Activated:Connect(function()
@@ -1835,13 +1968,15 @@ do
                 ColorSequenceKeypoint.new(1, Color3.fromRGB(16, 185, 129))
             })
             spinBtn.Text = "■  STOP AUTO SPIN (RUNNING)"
-            checkAutoSpin()
+            TenantState.SpinArmed = true
+            startSpinWatcher()
         else
             spinGrad.Color = ColorSequence.new({
                 ColorSequenceKeypoint.new(0, Color3.fromRGB(244, 63, 94)),
                 ColorSequenceKeypoint.new(1, Color3.fromRGB(225, 29, 72))
             })
-            spinBtn.Text = "▶  START AUTO SPIN GRATIS (TIAP 10)"
+            spinBtn.Text = "▶  START AUTO SPIN (SAAT 10 PENYEWA)"
+            stopSpinWatcher()
         end
     end))
 end
@@ -2105,6 +2240,7 @@ local function shutdown()
     pcall(stopPlantingLoop)
     pcall(stopCleaningLoop)
     pcall(stopTenantWorker)
+    pcall(stopSpinWatcher)
     pcall(stopAntiAfk)
 
     for _, conn in ipairs(Connections) do
