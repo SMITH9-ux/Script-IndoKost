@@ -184,7 +184,7 @@ local CleanConfig = {
     TargetName = "kotoran",
     TargetMaterial = Enum.Material.Plastic,
     DefaultKosanID = "8833771934_19",
-    DefaultRadius = 100, -- Default Jarak Jauh (9999 studs untuk jangkauan global)
+    DefaultRadius = 9999, -- Default Jarak Jauh (9999 studs untuk jangkauan global)
     DefaultLoop = 0.5,
     MinLoopInterval = 0.05,
 }
