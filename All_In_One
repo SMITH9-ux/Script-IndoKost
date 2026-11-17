@@ -184,7 +184,7 @@ local CleanConfig = {
     TargetName = "kotoran",
     TargetMaterial = Enum.Material.Plastic,
     DefaultKosanID = "8833771934_19",
-    DefaultRadius = 9999, -- Default Jarak Jauh (9999 studs untuk jangkauan global)
+    DefaultRadius = 100, -- Default Jarak Jauh (9999 studs untuk jangkauan global)
     DefaultLoop = 0.5,
     MinLoopInterval = 0.05,
 }
@@ -291,109 +291,19 @@ local function findNearestDirt()
 end
 
 -- ========================================================
--- BACKGROUND WORKERS (DILENGKAPI JARAK JAUH)
--- ========================================================
-local isPlantRunning = false
-local plantThread = nil
-
-local isCleanRunning = false
-local cleanThread = nil
-
-local function executePlantCycle()
-    local activePlots = getActivePlots()
-    if #activePlots == 0 then return end
-
-    if beliBibitRF then
-        local buySuccess, buyErr = pcall(function()
-            return beliBibitRF:InvokeServer(PlantConfig.CROP_NAME, PlantConfig.BUY_COUNT)
-        end)
-        if not buySuccess then
-            warn("[AutoFarm Error]: Beli bibit gagal:", buyErr)
-        end
-    end
-
-    task.wait(PlantConfig.INTER_ACTION_DELAY)
-
-    for index, plotPos in ipairs(activePlots) do
-        if not isPlantRunning or not isScriptRunning then break end
-
-        if tanamRF then
-            local plantSuccess, plantErr = pcall(function()
-                return tanamRF:InvokeServer(PlantConfig.CROP_NAME, plotPos)
-            end)
-            if not plantSuccess then
-                warn(string.format("[AutoFarm Error]: Plot #%d gagal: %s", index, tostring(plantErr)))
-            end
-        end
-
-        task.wait(PlantConfig.INTER_ACTION_DELAY)
-    end
-end
-
-local function startPlantingLoop()
-    plantThread = task.spawn(function()
-        while isPlantRunning and isScriptRunning do
-            executePlantCycle()
-            task.wait(PlantConfig.CYCLE_COOLDOWN)
-        end
-    end)
-end
-
-local function stopPlantingLoop()
-    isPlantRunning = false
-    if plantThread then
-        task.cancel(plantThread)
-        plantThread = nil
-    end
-end
-
-local function startCleaningLoop()
-    cleanThread = task.spawn(function()
-        while isCleanRunning and isScriptRunning do
-            local target = findNearestDirt()
-            if target then
-                -- Mode Jarak Jauh: Teleport ke dekat kotoran
-                if CleanState.USE_TELEPORT then
-                    safeTeleport(target.Position)
-                    task.wait(0.06)
-                end
-
-                fireCleanSignal(CleanState.CurrentKosanID)
-
-                -- Bypass jarak ProximityPrompt kotoran
-                local prompt = target:FindFirstChildWhichIsA("ProximityPrompt", true)
-                if prompt then
-                    prompt.RequiresLineOfSight = false
-                    prompt.MaxActivationDistance = 999999
-                    prompt.HoldDuration = 0
-                    if prompt.Enabled and typeof(fireproximityprompt) == "function" then
-                        fireproximityprompt(prompt)
-                    end
-                end
-            end
-            task.wait(CleanState.LoopInterval)
-        end
-    end)
-end
-
-local function stopCleaningLoop()
-    isCleanRunning = false
-    if cleanThread then
-        task.cancel(cleanThread)
-        cleanThread = nil
-    end
-end
-
--- ========================================================
--- AUTO PICK UP & AUTO BUANG SAMPAH
+-- AUTO SAMPAH (BAGIAN DARI AUTO CLEAN): AMBIL + BUANG
 -- ========================================================
 local TrashConfig = {
     -- Kata kunci (huruf kecil). Dicocokkan dengan nama/teks ProximityPrompt
     -- dan nama 3 parent di atasnya. Sesuaikan dengan nama objek di game.
     PickupKeywords  = { "sampah", "trash", "garbage", "litter" },
     DisposeKeywords = { "tong sampah", "tempat sampah", "trashcan", "trash can", "trash bin", "dustbin", "buang", "dispose" },
-    LoopInterval = 0.5,
-    USE_TELEPORT = true, -- Auto TP ke sampah / tempat sampah
+    CleanDoneStreak = 3, -- berapa kali cek berturut-turut tanpa kotoran sebelum cek persen kebersihan
+
+    -- Tunggu kebersihan rumah 100% sebelum lanjut ke sampah
+    RequireFullClean = true,
+    CleanPercentKeywords = { "bersih", "clean", "kebersihan", "kotor" }, -- teks/nama UI persen kebersihan
+    CleanPercentTimeout = 0, -- detik. 0 = tunggu 100% tanpa batas waktu; isi mis. 120 agar tidak macet
 
     -- Deteksi "penuh" (mode gabungan: ambil sampai penuh dulu, baru buang)
     MaxCarry = 5, -- kapasitas bawa sampah. SESUAIKAN dengan game
@@ -403,18 +313,16 @@ local TrashConfig = {
 }
 
 local TrashState = {
-    Pickup = false,
-    Dispose = false,
+    Enabled = true,         -- ikut alur sampah setelah rumah bersih
+    Phase = "BERSIH",       -- "BERSIH" > "TUNGGU" > "AMBIL" > "BUANG"
     PickupCount = 0,
     DisposeCount = 0,
-    Phase = "PICKUP",       -- "PICKUP" atau "BUANG" (mode gabungan)
     PickedSinceDispose = 0,
     DisposedThisPhase = 0,
     ToolDetected = false,   -- true bila sampah terdeteksi sebagai Tool di Backpack
     NoticeCached = false
 }
 
-local trashThread = nil
 local onTrashUpdate = function() end -- diisi oleh GUI
 
 local function hasKeyword(text, list)
@@ -556,12 +464,48 @@ local function isTrashEmpty()
     return TrashState.DisposedThisPhase >= need
 end
 
+-- Baca persen kebersihan rumah dari UI game (teks berisi angka + "%")
+-- Return: angka 0-100, atau nil bila tidak ditemukan
+local lastPctScan = 0
+local cachedPct = nil
+local function readCleanPercent()
+    if os.clock() - lastPctScan < 0.5 then
+        return cachedPct
+    end
+    lastPctScan = os.clock()
+
+    local found = nil
+    for _, obj in ipairs(PlayerGui:GetDescendants()) do
+        if (obj:IsA("TextLabel") or obj:IsA("TextButton")) and obj.Text ~= "" and guiShown(obj) then
+            local text = string.lower(obj.Text)
+            local num = string.match(text, "(%d+%.?%d*)%s*%%")
+            if num then
+                -- Cocokkan teks + nama objek & 3 parent dengan kata kunci kebersihan
+                local parts = { text, obj.Name }
+                local inst = obj.Parent
+                for _ = 1, 3 do
+                    if not inst or inst == PlayerGui then break end
+                    table.insert(parts, string.lower(inst.Name))
+                    inst = inst.Parent
+                end
+                if hasKeyword(table.concat(parts, " "), TrashConfig.CleanPercentKeywords) then
+                    found = tonumber(num)
+                    break
+                end
+            end
+        end
+    end
+
+    cachedPct = found
+    return found
+end
+
 -- Return: "noprompt" | "nofire" | "ok"
 local function trashStep(isDispose)
     local prompt = findNearestTrashPrompt(isDispose)
     if not prompt then return "noprompt" end
 
-    if TrashConfig.USE_TELEPORT then
+    if CleanState.USE_TELEPORT then
         local pos = promptPosition(prompt)
         if pos then
             safeTeleport(pos)
@@ -593,73 +537,323 @@ local function trashStep(isDispose)
     return "ok"
 end
 
-local function setTrashPhase(phase)
+local function setCleanPhase(phase)
+    local prev = TrashState.Phase
     TrashState.Phase = phase
     if phase == "BUANG" then
         TrashState.DisposedThisPhase = 0
-    else
+    elseif phase == "BERSIH" and prev == "BUANG" then
         TrashState.PickedSinceDispose = 0
     end
     onTrashUpdate()
 end
 
-local function startTrashWorker()
-    if trashThread then return end
-    trashThread = task.spawn(function()
-        local noPromptStreak = 0
-        local disposePhaseStart = 0
+-- ========================================================
+-- BACKGROUND WORKERS (DILENGKAPI JARAK JAUH)
+-- ========================================================
+local isPlantRunning = false
+local plantThread = nil
 
-        while (TrashState.Pickup or TrashState.Dispose) and isScriptRunning do
-            if TrashState.Pickup and TrashState.Dispose then
-                -- MODE GABUNGAN: pick up sampai penuh dulu, baru buang
-                if TrashState.Phase == "PICKUP" then
-                    local result = trashStep(false)
-                    noPromptStreak = (result == "noprompt") and (noPromptStreak + 1) or 0
+local isCleanRunning = false
+local cleanThread = nil
 
-                    local full = isTrashFull()
-                    -- Tidak ada sampah lagi di map tapi masih bawa sampah -> buang sekarang
-                    local leftover = noPromptStreak >= TrashConfig.NoPromptLimit
-                        and (getCarriedTrash() > 0 or TrashState.PickedSinceDispose > 0)
+local function executePlantCycle()
+    local activePlots = getActivePlots()
+    if #activePlots == 0 then return end
 
-                    if full or leftover then
-                        noPromptStreak = 0
-                        disposePhaseStart = os.clock()
-                        setTrashPhase("BUANG")
-                    end
-                else
-                    local result = trashStep(true)
-                    noPromptStreak = (result == "noprompt") and (noPromptStreak + 1) or 0
-
-                    local timedOut = (os.clock() - disposePhaseStart) >= TrashConfig.DisposePhaseTimeout
-                    local noBin = noPromptStreak >= TrashConfig.NoPromptLimit
-                    if isTrashEmpty() or timedOut or noBin then
-                        noPromptStreak = 0
-                        setTrashPhase("PICKUP")
-                    end
-                end
-            else
-                -- MODE TUNGGAL: jalan terus sesuai tombol yang aktif
-                if TrashState.Phase ~= "PICKUP" then
-                    TrashState.Phase = "PICKUP"
-                end
-                noPromptStreak = 0
-                if TrashState.Pickup then trashStep(false) end
-                if TrashState.Dispose then trashStep(true) end
-            end
-
-            onTrashUpdate()
-            task.wait(TrashConfig.LoopInterval)
+    if beliBibitRF then
+        local buySuccess, buyErr = pcall(function()
+            return beliBibitRF:InvokeServer(PlantConfig.CROP_NAME, PlantConfig.BUY_COUNT)
+        end)
+        if not buySuccess then
+            warn("[AutoFarm Error]: Beli bibit gagal:", buyErr)
         end
-        trashThread = nil
+    end
+
+    task.wait(PlantConfig.INTER_ACTION_DELAY)
+
+    for index, plotPos in ipairs(activePlots) do
+        if not isPlantRunning or not isScriptRunning then break end
+
+        if tanamRF then
+            local plantSuccess, plantErr = pcall(function()
+                return tanamRF:InvokeServer(PlantConfig.CROP_NAME, plotPos)
+            end)
+            if not plantSuccess then
+                warn(string.format("[AutoFarm Error]: Plot #%d gagal: %s", index, tostring(plantErr)))
+            end
+        end
+
+        task.wait(PlantConfig.INTER_ACTION_DELAY)
+    end
+end
+
+local function startPlantingLoop()
+    plantThread = task.spawn(function()
+        while isPlantRunning and isScriptRunning do
+            executePlantCycle()
+            task.wait(PlantConfig.CYCLE_COOLDOWN)
+        end
     end)
 end
 
-local function stopTrashWorker()
-    TrashState.Pickup = false
-    TrashState.Dispose = false
-    if trashThread then
-        task.cancel(trashThread)
-        trashThread = nil
+local function stopPlantingLoop()
+    isPlantRunning = false
+    if plantThread then
+        task.cancel(plantThread)
+        plantThread = nil
+    end
+end
+
+local function cleanDirtStep(target)
+    -- Mode Jarak Jauh: Teleport ke dekat kotoran
+    if CleanState.USE_TELEPORT then
+        safeTeleport(target.Position)
+        task.wait(0.06)
+    end
+
+    fireCleanSignal(CleanState.CurrentKosanID)
+
+    -- Bypass jarak ProximityPrompt kotoran
+    local prompt = target:FindFirstChildWhichIsA("ProximityPrompt", true)
+    if prompt then
+        prompt.RequiresLineOfSight = false
+        prompt.MaxActivationDistance = 999999
+        prompt.HoldDuration = 0
+        if prompt.Enabled and typeof(fireproximityprompt) == "function" then
+            fireproximityprompt(prompt)
+        end
+    end
+end
+
+-- Alur: BERSIH (kotoran) > TUNGGU (sampah muncul) > AMBIL (sampai penuh) > BUANG > BERSIH ...
+local function startCleaningLoop()
+    cleanThread = task.spawn(function()
+        local noDirtStreak = 0
+        local noPromptStreak = 0
+        local disposeStart = 0
+        local waitFullStart = nil
+
+        setCleanPhase("BERSIH")
+
+        while isCleanRunning and isScriptRunning do
+            local phase = TrashState.Phase
+
+            if not TrashState.Enabled then
+                -- Mode sampah dimatikan: hanya bersihkan kotoran seperti biasa
+                phase = "BERSIH"
+                if TrashState.Phase ~= "BERSIH" then setCleanPhase("BERSIH") end
+            end
+
+            if phase == "BERSIH" then
+                if TrashState.Enabled then
+                    TrashState.CleanPercent = readCleanPercent()
+                end
+
+                local target = findNearestDirt()
+                if target then
+                    noDirtStreak = 0
+                    waitFullStart = nil
+                    cleanDirtStep(target)
+                else
+                    noDirtStreak += 1
+                    if TrashState.Enabled and noDirtStreak >= TrashConfig.CleanDoneStreak then
+                        -- Tidak ada kotoran: pastikan kebersihan sudah 100% dulu
+                        local pct = TrashConfig.RequireFullClean and TrashState.CleanPercent or nil
+                        local done = (pct == nil) or (pct >= 100)
+
+                        if not done and TrashConfig.CleanPercentTimeout > 0 then
+                            waitFullStart = waitFullStart or os.clock()
+                            if os.clock() - waitFullStart >= TrashConfig.CleanPercentTimeout then
+                                done = true
+                            end
+                        end
+
+                        if done then
+                            noDirtStreak = 0
+                            waitFullStart = nil
+                            -- Rumah 100% bersih -> tunggu sampah muncul
+                            setCleanPhase("TUNGGU")
+                        end
+                    end
+                end
+
+            elseif phase == "TUNGGU" then
+                if findNearestDirt() then
+                    -- Ada kotoran baru: bersihkan dulu
+                    setCleanPhase("BERSIH")
+                elseif findNearestTrashPrompt(false) then
+                    -- Sampah sudah muncul: mulai ambil
+                    noPromptStreak = 0
+                    setCleanPhase("AMBIL")
+                end
+
+            elseif phase == "AMBIL" then
+                local result = trashStep(false)
+                noPromptStreak = (result == "ok") and 0 or (noPromptStreak + 1)
+
+                local full = isTrashFull()
+                local noMore = noPromptStreak >= TrashConfig.NoPromptLimit
+                local carrying = getCarriedTrash() > 0 or TrashState.PickedSinceDispose > 0
+
+                if full or (noMore and carrying) then
+                    -- Penuh (atau sampah habis tapi masih bawa) -> buang
+                    noPromptStreak = 0
+                    disposeStart = os.clock()
+                    setCleanPhase("BUANG")
+                elseif noMore then
+                    -- Tidak ada sampah lagi dan tidak membawa apa-apa -> tunggu lagi
+                    noPromptStreak = 0
+                    setCleanPhase("TUNGGU")
+                end
+
+            elseif phase == "BUANG" then
+                local result = trashStep(true)
+                noPromptStreak = (result == "ok") and 0 or (noPromptStreak + 1)
+
+                local timedOut = (os.clock() - disposeStart) >= TrashConfig.DisposePhaseTimeout
+                local noBin = noPromptStreak >= TrashConfig.NoPromptLimit
+                if isTrashEmpty() or timedOut or noBin then
+                    noPromptStreak = 0
+                    noDirtStreak = 0
+                    setCleanPhase("BERSIH")
+                end
+            end
+
+            onTrashUpdate()
+            task.wait(CleanState.LoopInterval)
+        end
+    end)
+end
+
+local function stopCleaningLoop()
+    isCleanRunning = false
+    if cleanThread then
+        task.cancel(cleanThread)
+        cleanThread = nil
+    end
+    TrashState.Phase = "BERSIH"
+    TrashState.PickedSinceDispose = 0
+    TrashState.DisposedThisPhase = 0
+    TrashState.CleanPercent = nil
+    onTrashUpdate()
+end
+
+-- ========================================================
+-- AUTO ACC PENYEWA
+-- ========================================================
+local TenantConfig = {
+    Interval = 1,   -- detik antar permintaan terima penyewa
+    SpinEvery = 10  -- spin gratis setiap N penyewa yang diterima
+}
+
+local TenantState = {
+    Running = false,
+    CallCount = 0,
+    AcceptCount = 0,
+    SpinEnabled = false,
+    SpinBaseline = 0, -- jumlah penyewa yang sudah "dibayar" dengan spin
+    SpinCount = 0,
+    SpinBusy = false
+}
+
+local tenantRF = nil
+local tenantThread = nil
+local onTenantUpdate = function() end -- diisi oleh GUI
+
+local function getTenantRemote()
+    if tenantRF and tenantRF.Parent then return tenantRF end
+    pcall(function()
+        tenantRF = ReplicatedStorage
+            :WaitForChild("NKSystem", 5)
+            :WaitForChild("Packages", 5)
+            :WaitForChild("Knit", 5)
+            :WaitForChild("Services", 5)
+            :WaitForChild("PenyewaService", 5)
+            :WaitForChild("RF", 5)
+            :WaitForChild("Respond", 5)
+    end)
+    return tenantRF
+end
+
+local spinRF = nil
+local function getSpinRemote()
+    if spinRF and spinRF.Parent then return spinRF end
+    pcall(function()
+        spinRF = ReplicatedStorage
+            :WaitForChild("NKSystem", 5)
+            :WaitForChild("Packages", 5)
+            :WaitForChild("Knit", 5)
+            :WaitForChild("Services", 5)
+            :WaitForChild("GachaService", 5)
+            :WaitForChild("RF", 5)
+            :WaitForChild("SpinX10WithFree", 5)
+    end)
+    return spinRF
+end
+
+-- Spin gratis tiap TenantConfig.SpinEvery penyewa diterima
+local function checkAutoSpin()
+    if not TenantState.SpinEnabled or TenantState.SpinBusy then return end
+    if TenantState.AcceptCount - TenantState.SpinBaseline < TenantConfig.SpinEvery then return end
+
+    TenantState.SpinBusy = true
+    task.spawn(function()
+        local rf = getSpinRemote()
+        if rf then
+            local ok, result = pcall(function()
+                return rf:InvokeServer()
+            end)
+            if ok then
+                TenantState.SpinCount += 1
+            else
+                warn("[AutoSpin Error]:", result)
+            end
+        else
+            warn("[AutoSpin]: Remote GachaService.SpinX10WithFree tidak ditemukan")
+        end
+
+        -- Maju ke kelipatan berikutnya (juga bila gagal, agar tidak spam)
+        TenantState.SpinBaseline += TenantConfig.SpinEvery
+        TenantState.SpinBusy = false
+        onTenantUpdate()
+        checkAutoSpin() -- kejar spin yang tertunda
+    end)
+end
+
+local function startTenantWorker()
+    if tenantThread then return end
+    tenantThread = task.spawn(function()
+        while TenantState.Running and isScriptRunning do
+            local rf = getTenantRemote()
+            if rf then
+                local ok, result = pcall(function()
+                    return rf:InvokeServer(true) -- true = terima penyewa
+                end)
+                if ok then
+                    TenantState.CallCount += 1
+                    if result == true then
+                        TenantState.AcceptCount += 1
+                        checkAutoSpin()
+                    end
+                    onTenantUpdate()
+                else
+                    warn("[AutoAccPenyewa Error]:", result)
+                end
+            else
+                warn("[AutoAccPenyewa]: Remote PenyewaService.Respond tidak ditemukan")
+            end
+            task.wait(TenantConfig.Interval)
+        end
+        tenantThread = nil
+    end)
+end
+
+local function stopTenantWorker()
+    TenantState.Running = false
+    if tenantThread then
+        task.cancel(tenantThread)
+        tenantThread = nil
     end
 end
 
@@ -889,15 +1083,19 @@ local function createTabPill(title)
     btn.Text = title
     btn.TextColor3 = Color3.fromRGB(130, 135, 155)
     btn.TextSize = 10
+    btn.TextScaled = true
     btn.AutoButtonColor = false
     btn.Parent = TabBar
+    local sizeLimit = Instance.new("UITextSizeConstraint", btn)
+    sizeLimit.MaxTextSize = 10
+    sizeLimit.MinTextSize = 6
     Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
     return btn
 end
 
 local TabPlantBtn = createTabPill("🌱 PLANT")
 local TabCleanBtn = createTabPill("🧹 CLEAN")
-local TabTrashBtn = createTabPill("🗑️ SAMPAH")
+local TabTenantBtn = createTabPill("🏠 SEWA")
 local TabAfkBtn   = createTabPill("🛡️ AFK")
 
 -- ========================================================
@@ -1227,6 +1425,67 @@ local IdInput     = createCyberInput("IdInput", "Contoh: UserID_RoomID", CleanSt
 local RadiusInput = createCyberInput("RadiusInput", "Jarak deteksi studs", CleanState.Radius, "RADIUS DETEKSI (STUDS):", 46)
 local LoopInput   = createCyberInput("LoopInput", "Delay loop detik", CleanState.LoopInterval, "LOOP INTERVAL (DETIK):", 86)
 
+-- Card: Sampah Otomatis (Ambil + Buang) setelah rumah bersih
+do
+    local trashCard = createModernCard(CleanPage, 36, 232)
+
+    local trashLabel = Instance.new("TextLabel")
+    trashLabel.Size = UDim2.new(1, -90, 1, 0)
+    trashLabel.Position = UDim2.new(0, 12, 0, 0)
+    trashLabel.BackgroundTransparency = 1
+    trashLabel.Font = Enum.Font.GothamBold
+    trashLabel.Text = "🗑️ Sampah: Tunggu > Ambil > Buang"
+    trashLabel.TextColor3 = Color3.fromRGB(230, 230, 245)
+    trashLabel.TextSize = 10
+    trashLabel.TextXAlignment = Enum.TextXAlignment.Left
+    trashLabel.Parent = trashCard
+
+    local trashBtn = Instance.new("TextButton")
+    trashBtn.Name = "TrashToggleBtn"
+    trashBtn.Size = UDim2.new(0, 60, 0, 22)
+    trashBtn.Position = UDim2.new(1, -72, 0.5, -11)
+    trashBtn.BackgroundColor3 = TrashState.Enabled and Color3.fromRGB(16, 185, 129) or Color3.fromRGB(45, 48, 65)
+    trashBtn.BorderSizePixel = 0
+    trashBtn.Font = Enum.Font.GothamBold
+    trashBtn.Text = TrashState.Enabled and "ON" or "OFF"
+    trashBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    trashBtn.TextSize = 10
+    trashBtn.AutoButtonColor = false
+    trashBtn.Parent = trashCard
+    Instance.new("UICorner", trashBtn).CornerRadius = UDim.new(0, 6)
+
+    local PHASE_LABELS = {
+        BERSIH = "BERSIHKAN",
+        TUNGGU = "TUNGGU SAMPAH",
+        AMBIL  = "AMBIL SAMPAH",
+        BUANG  = "BUANG SAMPAH"
+    }
+
+    onTrashUpdate = function()
+        if not isCleanRunning then
+            CleanSubStatus.Text = "Target: Objek Kotoran (Plastic)"
+            return
+        end
+        if not TrashState.Enabled then
+            CleanSubStatus.Text = "Fase: BERSIHKAN (sampah OFF)"
+            return
+        end
+        local label = PHASE_LABELS[TrashState.Phase] or TrashState.Phase
+        if TrashState.Phase == "BERSIH" and TrashState.CleanPercent then
+            label = string.format("%s %d%%", label, math.floor(TrashState.CleanPercent))
+        end
+        CleanSubStatus.Text = string.format("Fase: %s | Bawa: %d/%d", label, getCarriedTrash(), TrashConfig.MaxCarry)
+    end
+
+    table.insert(Connections, trashBtn.Activated:Connect(function()
+        TrashState.Enabled = not TrashState.Enabled
+        local col = TrashState.Enabled and Color3.fromRGB(16, 185, 129) or Color3.fromRGB(45, 48, 65)
+        TweenService:Create(trashBtn, TWEEN_FAST, { BackgroundColor3 = col }):Play()
+        trashBtn.Text = TrashState.Enabled and "ON" or "OFF"
+        onTrashUpdate()
+    end))
+end
+
 -- Toggle Auto Clean Hero Button
 local ToggleCleanBtn = Instance.new("TextButton")
 ToggleCleanBtn.Name = "ToggleCleanBtn"
@@ -1347,110 +1606,7 @@ AfkBtnGrad.Color = ColorSequence.new({
     ColorSequenceKeypoint.new(1, Color3.fromRGB(225, 29, 72))
 })
 
--- ========================================================
--- TAB 3: AUTO SAMPAH PAGE (PICK UP & BUANG TERPISAH)
--- ========================================================
-local TrashPage = Instance.new("Frame")
-TrashPage.Name = "TrashPage"
-TrashPage.Size = UDim2.new(1, 0, 1, 0)
-TrashPage.BackgroundTransparency = 1
-TrashPage.Visible = false
-TrashPage.Parent = ContentFrame
-
--- Card 1: Status Sampah
-local TrashStatusCard = createModernCard(TrashPage, 48, 0)
-
-local TrashCardIcon = Instance.new("TextLabel")
-TrashCardIcon.Size = UDim2.new(0, 24, 0, 24)
-TrashCardIcon.Position = UDim2.new(0, 12, 0.5, -12)
-TrashCardIcon.BackgroundTransparency = 1
-TrashCardIcon.Font = Enum.Font.GothamBold
-TrashCardIcon.Text = "🗑️"
-TrashCardIcon.TextSize = 16
-TrashCardIcon.Parent = TrashStatusCard
-
-local TrashTitleLabel = Instance.new("TextLabel")
-TrashTitleLabel.Size = UDim2.new(1, -120, 0, 16)
-TrashTitleLabel.Position = UDim2.new(0, 42, 0, 8)
-TrashTitleLabel.BackgroundTransparency = 1
-TrashTitleLabel.Font = Enum.Font.GothamBold
-TrashTitleLabel.Text = "Auto Sampah"
-TrashTitleLabel.TextColor3 = Color3.fromRGB(240, 240, 250)
-TrashTitleLabel.TextSize = 11
-TrashTitleLabel.TextXAlignment = Enum.TextXAlignment.Left
-TrashTitleLabel.Parent = TrashStatusCard
-
-local TrashSubStatus = Instance.new("TextLabel")
-TrashSubStatus.Size = UDim2.new(1, -120, 0, 14)
-TrashSubStatus.Position = UDim2.new(0, 42, 0, 25)
-TrashSubStatus.BackgroundTransparency = 1
-TrashSubStatus.Font = Enum.Font.Gotham
-TrashSubStatus.Text = "Fase: - | Bawa: 0/" .. TrashConfig.MaxCarry
-TrashSubStatus.TextColor3 = Color3.fromRGB(140, 145, 165)
-TrashSubStatus.TextSize = 10
-TrashSubStatus.TextXAlignment = Enum.TextXAlignment.Left
-TrashSubStatus.Parent = TrashStatusCard
-
-local TrashStatusBadge = Instance.new("Frame")
-TrashStatusBadge.Size = UDim2.new(0, 68, 0, 22)
-TrashStatusBadge.Position = UDim2.new(1, -78, 0.5, -11)
-TrashStatusBadge.BackgroundColor3 = Color3.fromRGB(30, 33, 46)
-TrashStatusBadge.BorderSizePixel = 0
-TrashStatusBadge.Parent = TrashStatusCard
-Instance.new("UICorner", TrashStatusBadge).CornerRadius = UDim.new(0, 6)
-
-local TrashBadgeText = Instance.new("TextLabel")
-TrashBadgeText.Size = UDim2.new(1, 0, 1, 0)
-TrashBadgeText.BackgroundTransparency = 1
-TrashBadgeText.Font = Enum.Font.GothamBold
-TrashBadgeText.Text = "● IDLE"
-TrashBadgeText.TextColor3 = Color3.fromRGB(160, 165, 185)
-TrashBadgeText.TextSize = 9
-TrashBadgeText.Parent = TrashStatusBadge
-
--- Card 2: Toggle Auto TP Sampah
-local TrashTpCard = createModernCard(TrashPage, 40, 54)
-
-local TrashTpLabel = Instance.new("TextLabel")
-TrashTpLabel.Size = UDim2.new(1, -90, 1, 0)
-TrashTpLabel.Position = UDim2.new(0, 12, 0, 0)
-TrashTpLabel.BackgroundTransparency = 1
-TrashTpLabel.Font = Enum.Font.GothamBold
-TrashTpLabel.Text = "🚀 Auto TP ke Sampah / Tong"
-TrashTpLabel.TextColor3 = Color3.fromRGB(230, 230, 245)
-TrashTpLabel.TextSize = 10
-TrashTpLabel.TextXAlignment = Enum.TextXAlignment.Left
-TrashTpLabel.Parent = TrashTpCard
-
-local TpTrashBtn = Instance.new("TextButton")
-TpTrashBtn.Name = "TpTrashBtn"
-TpTrashBtn.Size = UDim2.new(0, 60, 0, 24)
-TpTrashBtn.Position = UDim2.new(1, -72, 0.5, -12)
-TpTrashBtn.BackgroundColor3 = TrashConfig.USE_TELEPORT and Color3.fromRGB(16, 185, 129) or Color3.fromRGB(45, 48, 65)
-TpTrashBtn.BorderSizePixel = 0
-TpTrashBtn.Font = Enum.Font.GothamBold
-TpTrashBtn.Text = TrashConfig.USE_TELEPORT and "ON" or "OFF"
-TpTrashBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-TpTrashBtn.TextSize = 10
-TpTrashBtn.AutoButtonColor = false
-TpTrashBtn.Parent = TrashTpCard
-Instance.new("UICorner", TpTrashBtn).CornerRadius = UDim.new(0, 6)
-
--- Card 3: Info
-local TrashInfoCard = createModernCard(TrashPage, 40, 100)
-
-local TrashInfoLabel = Instance.new("TextLabel")
-TrashInfoLabel.Size = UDim2.new(1, -24, 1, 0)
-TrashInfoLabel.Position = UDim2.new(0, 12, 0, 0)
-TrashInfoLabel.BackgroundTransparency = 1
-TrashInfoLabel.Font = Enum.Font.GothamMedium
-TrashInfoLabel.Text = "Diambil: 0 | Dibuang: 0\nNyalakan dua-duanya: ambil sampai max, lalu buang"
-TrashInfoLabel.TextColor3 = Color3.fromRGB(150, 155, 175)
-TrashInfoLabel.TextSize = 9
-TrashInfoLabel.TextWrapped = true
-TrashInfoLabel.Parent = TrashInfoCard
-
--- Hero Buttons (terpisah)
+-- Helper tombol START/STOP besar (dipakai tab Penyewa)
 local function createHeroToggle(parent, name, text, posY)
     local btn = Instance.new("TextButton")
     btn.Name = name
@@ -1475,8 +1631,132 @@ local function createHeroToggle(parent, name, text, posY)
     return btn, grad
 end
 
-local TogglePickupBtn, PickupBtnGrad = createHeroToggle(TrashPage, "TogglePickupBtn", "▶  START AUTO PICK UP SAMPAH", -92)
-local ToggleDisposeBtn, DisposeBtnGrad = createHeroToggle(TrashPage, "ToggleDisposeBtn", "▶  START AUTO BUANG SAMPAH", -44)
+
+-- ========================================================
+-- TAB: AUTO ACC PENYEWA (TOMBOL TERPISAH)
+-- ========================================================
+local TenantPage = Instance.new("Frame")
+TenantPage.Name = "TenantPage"
+TenantPage.Size = UDim2.new(1, 0, 1, 0)
+TenantPage.BackgroundTransparency = 1
+TenantPage.Visible = false
+TenantPage.Parent = ContentFrame
+
+do
+    local statusCard = createModernCard(TenantPage, 48, 0)
+
+    local icon = Instance.new("TextLabel")
+    icon.Size = UDim2.new(0, 24, 0, 24)
+    icon.Position = UDim2.new(0, 12, 0.5, -12)
+    icon.BackgroundTransparency = 1
+    icon.Font = Enum.Font.GothamBold
+    icon.Text = "🏠"
+    icon.TextSize = 16
+    icon.Parent = statusCard
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, -120, 0, 16)
+    title.Position = UDim2.new(0, 42, 0, 8)
+    title.BackgroundTransparency = 1
+    title.Font = Enum.Font.GothamBold
+    title.Text = "Auto Acc Penyewa"
+    title.TextColor3 = Color3.fromRGB(240, 240, 250)
+    title.TextSize = 11
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Parent = statusCard
+
+    local sub = Instance.new("TextLabel")
+    sub.Size = UDim2.new(1, -120, 0, 14)
+    sub.Position = UDim2.new(0, 42, 0, 25)
+    sub.BackgroundTransparency = 1
+    sub.Font = Enum.Font.Gotham
+    sub.Text = "Diterima: 0 | Req: 0 | Spin: 0"
+    sub.TextColor3 = Color3.fromRGB(140, 145, 165)
+    sub.TextSize = 10
+    sub.TextXAlignment = Enum.TextXAlignment.Left
+    sub.Parent = statusCard
+
+    local badge = Instance.new("Frame")
+    badge.Size = UDim2.new(0, 68, 0, 22)
+    badge.Position = UDim2.new(1, -78, 0.5, -11)
+    badge.BackgroundColor3 = Color3.fromRGB(30, 33, 46)
+    badge.BorderSizePixel = 0
+    badge.Parent = statusCard
+    Instance.new("UICorner", badge).CornerRadius = UDim.new(0, 6)
+
+    local badgeText = Instance.new("TextLabel")
+    badgeText.Size = UDim2.new(1, 0, 1, 0)
+    badgeText.BackgroundTransparency = 1
+    badgeText.Font = Enum.Font.GothamBold
+    badgeText.Text = "● OFF"
+    badgeText.TextColor3 = Color3.fromRGB(160, 165, 185)
+    badgeText.TextSize = 9
+    badgeText.Parent = badge
+
+    local infoCard = createModernCard(TenantPage, 48, 54)
+    local info = Instance.new("TextLabel")
+    info.Size = UDim2.new(1, -24, 1, 0)
+    info.Position = UDim2.new(0, 12, 0, 0)
+    info.BackgroundTransparency = 1
+    info.Font = Enum.Font.GothamMedium
+    info.Text = "Acc penyewa & Spin Gratis punya tombol sendiri. Spin otomatis tiap 10 penyewa diterima."
+    info.TextColor3 = Color3.fromRGB(150, 155, 175)
+    info.TextSize = 9
+    info.TextWrapped = true
+    info.Parent = infoCard
+
+    local toggleBtn, toggleGrad = createHeroToggle(TenantPage, "ToggleTenantBtn", "▶  START AUTO ACC PENYEWA", -92)
+    local spinBtn, spinGrad = createHeroToggle(TenantPage, "ToggleSpinBtn", "▶  START AUTO SPIN GRATIS (TIAP 10)", -44)
+
+    onTenantUpdate = function()
+        sub.Text = string.format("Diterima: %d | Req: %d | Spin: %d", TenantState.AcceptCount, TenantState.CallCount, TenantState.SpinCount)
+    end
+
+    table.insert(Connections, toggleBtn.Activated:Connect(function()
+        TenantState.Running = not TenantState.Running
+
+        if TenantState.Running then
+            toggleGrad.Color = ColorSequence.new({
+                ColorSequenceKeypoint.new(0, Color3.fromRGB(52, 211, 153)),
+                ColorSequenceKeypoint.new(1, Color3.fromRGB(16, 185, 129))
+            })
+            toggleBtn.Text = "■  STOP AUTO ACC PENYEWA (RUNNING)"
+            badgeText.Text = "● ACTIVE"
+            badgeText.TextColor3 = Color3.fromRGB(52, 211, 153)
+            badge.BackgroundColor3 = Color3.fromRGB(20, 45, 35)
+            startTenantWorker()
+        else
+            toggleGrad.Color = ColorSequence.new({
+                ColorSequenceKeypoint.new(0, Color3.fromRGB(244, 63, 94)),
+                ColorSequenceKeypoint.new(1, Color3.fromRGB(225, 29, 72))
+            })
+            toggleBtn.Text = "▶  START AUTO ACC PENYEWA"
+            badgeText.Text = "● OFF"
+            badgeText.TextColor3 = Color3.fromRGB(160, 165, 185)
+            badge.BackgroundColor3 = Color3.fromRGB(30, 33, 46)
+            stopTenantWorker()
+        end
+    end))
+
+    table.insert(Connections, spinBtn.Activated:Connect(function()
+        TenantState.SpinEnabled = not TenantState.SpinEnabled
+
+        if TenantState.SpinEnabled then
+            spinGrad.Color = ColorSequence.new({
+                ColorSequenceKeypoint.new(0, Color3.fromRGB(52, 211, 153)),
+                ColorSequenceKeypoint.new(1, Color3.fromRGB(16, 185, 129))
+            })
+            spinBtn.Text = "■  STOP AUTO SPIN (RUNNING)"
+            checkAutoSpin()
+        else
+            spinGrad.Color = ColorSequence.new({
+                ColorSequenceKeypoint.new(0, Color3.fromRGB(244, 63, 94)),
+                ColorSequenceKeypoint.new(1, Color3.fromRGB(225, 29, 72))
+            })
+            spinBtn.Text = "▶  START AUTO SPIN GRATIS (TIAP 10)"
+        end
+    end))
+end
 
 -- ========================================================
 -- FOOTER BAR (CREDIT: SMITH GANTENG)
@@ -1513,7 +1793,7 @@ local TAB_INACTIVE_TXT = Color3.fromRGB(130, 135, 155)
 local TAB_MAP = {
     Plant = { page = PlantPage, btn = TabPlantBtn },
     Clean = { page = CleanPage, btn = TabCleanBtn },
-    Trash = { page = TrashPage, btn = TabTrashBtn },
+    Tenant = { page = TenantPage, btn = TabTenantBtn },
     Afk   = { page = AfkPage,   btn = TabAfkBtn },
 }
 
@@ -1533,7 +1813,7 @@ switchTab("Plant")
 
 table.insert(Connections, TabPlantBtn.Activated:Connect(function() switchTab("Plant") end))
 table.insert(Connections, TabCleanBtn.Activated:Connect(function() switchTab("Clean") end))
-table.insert(Connections, TabTrashBtn.Activated:Connect(function() switchTab("Trash") end))
+table.insert(Connections, TabTenantBtn.Activated:Connect(function() switchTab("Tenant") end))
 table.insert(Connections, TabAfkBtn.Activated:Connect(function() switchTab("Afk") end))
 
 -- ========================================================
@@ -1648,71 +1928,6 @@ table.insert(Connections, ToggleCleanBtn.Activated:Connect(function()
     end
 end))
 
--- Auto Sampah: UI update & toggles
-local function applyHeroState(btn, grad, running, onText, offText)
-    if running then
-        grad.Color = ColorSequence.new({
-            ColorSequenceKeypoint.new(0, Color3.fromRGB(52, 211, 153)),
-            ColorSequenceKeypoint.new(1, Color3.fromRGB(16, 185, 129))
-        })
-        btn.Text = onText
-    else
-        grad.Color = ColorSequence.new({
-            ColorSequenceKeypoint.new(0, Color3.fromRGB(244, 63, 94)),
-            ColorSequenceKeypoint.new(1, Color3.fromRGB(225, 29, 72))
-        })
-        btn.Text = offText
-    end
-end
-
-local function refreshTrashBadge()
-    local active = TrashState.Pickup or TrashState.Dispose
-    TrashBadgeText.Text = active and "● ACTIVE" or "● IDLE"
-    TrashBadgeText.TextColor3 = active and Color3.fromRGB(52, 211, 153) or Color3.fromRGB(160, 165, 185)
-    TrashStatusBadge.BackgroundColor3 = active and Color3.fromRGB(20, 45, 35) or Color3.fromRGB(30, 33, 46)
-end
-
-onTrashUpdate = function()
-    local phase = "-"
-    if TrashState.Pickup and TrashState.Dispose then
-        phase = TrashState.Phase
-    elseif TrashState.Pickup then
-        phase = "PICKUP"
-    elseif TrashState.Dispose then
-        phase = "BUANG"
-    end
-    TrashSubStatus.Text = string.format("Fase: %s | Bawa: %d/%d", phase, getCarriedTrash(), TrashConfig.MaxCarry)
-    TrashInfoLabel.Text = string.format("Diambil: %d | Dibuang: %d\nNyalakan dua-duanya: ambil sampai max, lalu buang",
-        TrashState.PickupCount, TrashState.DisposeCount)
-end
-
-table.insert(Connections, TpTrashBtn.Activated:Connect(function()
-    TrashConfig.USE_TELEPORT = not TrashConfig.USE_TELEPORT
-    local col = TrashConfig.USE_TELEPORT and Color3.fromRGB(16, 185, 129) or Color3.fromRGB(45, 48, 65)
-    TweenService:Create(TpTrashBtn, TWEEN_FAST, { BackgroundColor3 = col }):Play()
-    TpTrashBtn.Text = TrashConfig.USE_TELEPORT and "ON" or "OFF"
-end))
-
-table.insert(Connections, TogglePickupBtn.Activated:Connect(function()
-    TrashState.Pickup = not TrashState.Pickup
-    applyHeroState(TogglePickupBtn, PickupBtnGrad, TrashState.Pickup,
-        "■  STOP AUTO PICK UP (RUNNING)", "▶  START AUTO PICK UP SAMPAH")
-    refreshTrashBadge()
-    TrashState.Phase = "PICKUP"
-    onTrashUpdate()
-    if TrashState.Pickup then startTrashWorker() end
-end))
-
-table.insert(Connections, ToggleDisposeBtn.Activated:Connect(function()
-    TrashState.Dispose = not TrashState.Dispose
-    applyHeroState(ToggleDisposeBtn, DisposeBtnGrad, TrashState.Dispose,
-        "■  STOP AUTO BUANG (RUNNING)", "▶  START AUTO BUANG SAMPAH")
-    refreshTrashBadge()
-    TrashState.Phase = "PICKUP"
-    onTrashUpdate()
-    if TrashState.Dispose then startTrashWorker() end
-end))
-
 -- Toggle Anti-AFK Button Logic
 table.insert(Connections, ToggleAfkBtn.Activated:Connect(function()
     isAntiAfkRunning = not isAntiAfkRunning
@@ -1761,7 +1976,7 @@ table.insert(Connections, CloseBtn.Activated:Connect(function()
     isScriptRunning = false
     stopPlantingLoop()
     stopCleaningLoop()
-    stopTrashWorker()
+    stopTenantWorker()
     stopAntiAfk()
 
     for _, conn in ipairs(Connections) do
