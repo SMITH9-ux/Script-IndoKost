@@ -1,4 +1,17 @@
-
+--[[
+    ╔═══════════════════════════════════════════════════════════════╗
+    ║                 ⚡ INDO-KOST ULTRA HUB v2.5 ⚡                 ║
+    ║                    👑 SMITH GANTENG 👑                        ║
+    ║       Modern Cyber Dark Edition - All-In-One Automation       ║
+    ║  - Auto Plant: Multi-Plot Selection + Auto TP ke Plot         ║
+    ║  - Auto Clean: Remote Signal + Auto Prompt + TP Jarak Jauh    ║
+    ║  - Anti-AFK: Cegah Kick Idle 20 Menit (Tombol Terpisah)       ║
+    ║  - Alur Clean: Bersih > Tunggu Sampah > Ambil > Buang         ║
+    ║  - Kompatibel multi-executor (fallback otomatis)              ║
+    ║  - Auto Acc Penyewa + Spin Gratis saat 10 Penyewa (Terpisah)  ║
+    ║  - High-End Glassmorphism UI with UIGradient & Micro-Tweens   ║
+    ╚═══════════════════════════════════════════════════════════════╝
+--]]
 
 -- SERVICES
 local Players = game:GetService("Players")
@@ -353,7 +366,17 @@ local TrashConfig = {
     MaxCarry = 5, -- kapasitas bawa sampah. SESUAIKAN dengan game
     FullKeywords = { "penuh", "inventory full", "backpack full", "bag full" },
     NoPromptLimit = 3,        -- berapa kali berturut-turut tidak ada target sebelum ganti fase
-    DisposePhaseTimeout = 20  -- detik, batas maksimal fase buang sebelum balik ambil
+    DisposePhaseTimeout = 20, -- detik, batas maksimal fase buang sebelum balik ambil
+
+    -- Kecepatan buang sampah (burst: 1x cari tong + 1x TP, lalu tembak berturut-turut)
+    DisposeSettleDelay = 0.03,  -- jeda setelah TP ke tong sebelum mulai buang
+    DisposeFireDelay = 0.04,    -- jeda antar buang sampah di tong yang sama
+    DisposeLoopInterval = 0.1,  -- jeda antar loop selama fase BUANG (menggantikan LoopInterval)
+
+    -- Buang hanya ke tong milik kosan sendiri
+    OwnBinOnly = true,          -- true = hanya tong yang cocok dengan ID kosan / owner kita
+    DisposeFallbackRadius = 150 -- studs. Bila tidak ada tong yang cocok owner, pakai tong terdekat
+                                -- dari lokasi ambil sampah dalam radius ini. 0 = tanpa fallback
 }
 
 local TrashState = {
@@ -364,7 +387,9 @@ local TrashState = {
     PickedSinceDispose = 0,
     DisposedThisPhase = 0,
     ToolDetected = false,   -- true bila sampah terdeteksi sebagai Tool di Backpack
-    NoticeCached = false
+    NoticeCached = false,
+    HomePos = nil,          -- lokasi terakhir ambil sampah (jangkar kosan sendiri)
+    LastBinLogged = nil
 }
 
 local onTrashUpdate = function() end -- diisi oleh GUI
@@ -403,12 +428,69 @@ local function promptPosition(prompt)
     return nil
 end
 
+-- Token identitas kosan sendiri (huruf kecil, minimal 4 karakter agar tidak salah cocok)
+local function ownerTokens()
+    local tokens = {}
+    local function add(v)
+        v = string.lower(tostring(v or ""))
+        if #v >= 4 and v ~= "-" then table.insert(tokens, v) end
+    end
+    add(CleanState.CurrentKosanID) -- UserID_RoomID lengkap
+    add(CleanState.KosanOwner)     -- UserID pemilik
+    add(LocalPlayer.UserId)
+    add(LocalPlayer.Name)
+    add(LocalPlayer.DisplayName)
+    return tokens
+end
+
+-- Apakah objek (atau salah satu parent-nya sampai Workspace) milik kosan kita?
+-- Dicek lewat nama dan Attribute (mis. Owner / UserId / KosanID).
+local function isOwnedByMe(inst, tokens)
+    local node = inst
+    while node and node ~= Workspace and node ~= game do
+        local lname = string.lower(node.Name)
+        for _, tk in ipairs(tokens) do
+            if string.find(lname, tk, 1, true) then return true end
+        end
+
+        local okAttr, attrs = pcall(function() return node:GetAttributes() end)
+        if okAttr and attrs then
+            for _, value in pairs(attrs) do
+                local sv = string.lower(tostring(value))
+                for _, tk in ipairs(tokens) do
+                    if sv == tk or string.find(sv, tk, 1, true) then return true end
+                end
+            end
+        end
+
+        node = node.Parent
+    end
+    return false
+end
+
+local function logBinChoice(prompt, owned)
+    if prompt == TrashState.LastBinLogged then return end
+    TrashState.LastBinLogged = prompt
+    if prompt then
+        print(string.format("[IndoKost] Tong dipilih (%s): %s",
+            owned and "cocok owner" or "fallback terdekat", prompt:GetFullName()))
+    else
+        warn("[IndoKost] Tidak ada tong milik kosan sendiri yang ditemukan (cek ID kosan / DisposeFallbackRadius)")
+    end
+end
+
 local function findNearestTrashPrompt(isDispose)
     local char = LocalPlayer.Character
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
     if not hrp then return nil end
 
-    local best, bestDist = nil, math.huge
+    local ownOnly = isDispose and TrashConfig.OwnBinOnly
+    local tokens = ownOnly and ownerTokens() or nil
+    local anchor = TrashState.HomePos or hrp.Position
+
+    local best, bestDist = nil, math.huge   -- terdekat (atau terdekat milik sendiri)
+    local fb, fbDist = nil, math.huge       -- cadangan: terdekat dari jangkar kosan
+
     for _, obj in ipairs(Workspace:GetDescendants()) do
         if obj:IsA("ProximityPrompt") and obj.Enabled then
             local sig = promptSignature(obj)
@@ -425,13 +507,32 @@ local function findNearestTrashPrompt(isDispose)
                 local pos = promptPosition(obj)
                 if pos then
                     local dist = (pos - hrp.Position).Magnitude
-                    if dist < bestDist then
+                    if ownOnly then
+                        if isOwnedByMe(obj, tokens) then
+                            if dist < bestDist then
+                                bestDist = dist
+                                best = obj
+                            end
+                        elseif TrashConfig.DisposeFallbackRadius > 0 then
+                            local d2 = (pos - anchor).Magnitude
+                            if d2 <= TrashConfig.DisposeFallbackRadius and d2 < fbDist then
+                                fbDist = d2
+                                fb = obj
+                            end
+                        end
+                    elseif dist < bestDist then
                         bestDist = dist
                         best = obj
                     end
                 end
             end
         end
+    end
+
+    if ownOnly then
+        local chosen = best or fb
+        logBinChoice(chosen, best ~= nil)
+        return chosen
     end
     return best
 end
@@ -570,10 +671,59 @@ local function trashStep(isDispose)
         TrashState.DisposeCount += 1
         TrashState.DisposedThisPhase += 1
     else
+        local hp = promptPosition(prompt)
+        if hp then TrashState.HomePos = hp end
         TrashState.PickupCount += 1
         TrashState.PickedSinceDispose += 1
     end
     return "ok"
+end
+
+local isCleanRunning = false
+local cleanThread = nil
+
+-- Buang cepat: cari tong 1x, TP 1x, lalu buang semua sampah berturut-turut
+-- Return: "noprompt" | "nofire" | "ok"
+local function disposeBurst()
+    local prompt = findNearestTrashPrompt(true)
+    if not prompt then return "noprompt" end
+
+    if CleanState.USE_TELEPORT then
+        local pos = promptPosition(prompt)
+        if pos then
+            safeTeleport(pos)
+            task.wait(TrashConfig.DisposeSettleDelay)
+        end
+    end
+
+    pcall(function()
+        prompt.RequiresLineOfSight = false
+        prompt.MaxActivationDistance = 999999
+        prompt.HoldDuration = 0
+    end)
+
+    local shots
+    if TrashState.ToolDetected then
+        shots = math.max(getCarriedTrash(), 1)
+    else
+        shots = math.clamp(TrashState.PickedSinceDispose, 1, TrashConfig.MaxCarry)
+    end
+
+    local fired = 0
+    for _ = 1, shots do
+        if not isCleanRunning or not isScriptRunning then break end
+        if not prompt.Parent or not prompt.Enabled then break end
+
+        if not firePrompt(prompt) then break end
+        fired += 1
+        TrashState.DisposeCount += 1
+        TrashState.DisposedThisPhase += 1
+
+        if TrashState.ToolDetected and getCarriedTrash() == 0 then break end
+        task.wait(TrashConfig.DisposeFireDelay)
+    end
+
+    return fired > 0 and "ok" or "nofire"
 end
 
 local function setCleanPhase(phase)
@@ -592,9 +742,6 @@ end
 -- ========================================================
 local isPlantRunning = false
 local plantThread = nil
-
-local isCleanRunning = false
-local cleanThread = nil
 
 local function executePlantCycle()
     local activePlots = getActivePlots()
@@ -775,7 +922,7 @@ local function startCleaningLoop()
                 end
 
             elseif phase == "BUANG" then
-                local result = trashStep(true)
+                local result = disposeBurst()
                 noPromptStreak = (result == "ok") and 0 or (noPromptStreak + 1)
 
                 local timedOut = (os.clock() - disposeStart) >= TrashConfig.DisposePhaseTimeout
@@ -788,7 +935,11 @@ local function startCleaningLoop()
             end
 
             onTrashUpdate()
-            task.wait(CleanState.LoopInterval)
+            if TrashState.Phase == "BUANG" then
+                task.wait(math.min(CleanState.LoopInterval, TrashConfig.DisposeLoopInterval))
+            else
+                task.wait(CleanState.LoopInterval)
+            end
         end
     end)
 end
@@ -1081,6 +1232,126 @@ local function stopAntiAfk()
 end
 
 -- ========================================================
+-- AUTO ISI PAKAN DOMBA (TernakService.IsiPakan)
+-- ========================================================
+local TernakConfig = {
+    Slots = { 1, 2 },   -- nomor kandang/slot domba yang diisi pakannya
+    Interval = 5,       -- detik antar siklus (satu siklus = isi semua slot)
+    CallsPerSlot = 2,   -- tiap slot dipanggil 2x berturut-turut (sesuai log: 1,1,2,2)
+    RepeatDelay = 0.15, -- detik antar pemanggilan di slot yang sama
+    CallDelay = 0.3     -- detik antar slot dalam satu siklus
+}
+
+local TernakState = {
+    Running = false,
+    FillCount = 0,      -- jumlah isi pakan yang berhasil (ok = true)
+    SkipCount = 0,      -- ditolak server (mis. pakan masih penuh / stok habis)
+    LastStok = nil,
+    LastJumlah = nil,
+    LastNama = "-"
+}
+
+local pakanRF = nil
+local ternakThread = nil
+local onTernakUpdate = function() end -- diisi oleh GUI
+
+local function getPakanRemote()
+    if pakanRF and pakanRF.Parent then return pakanRF end
+    pcall(function()
+        pakanRF = ReplicatedStorage
+            :WaitForChild("NKSystem", 5)
+            :WaitForChild("Packages", 5)
+            :WaitForChild("Knit", 5)
+            :WaitForChild("Services", 5)
+            :WaitForChild("TernakService", 5)
+            :WaitForChild("RF", 5)
+            :WaitForChild("IsiPakan", 5)
+    end)
+    return pakanRF
+end
+
+-- Isi pakan satu slot. Return true bila server menjawab ok = true
+local function feedSlot(slot)
+    local rf = getPakanRemote()
+    if not rf then
+        warn("[AutoPakan]: Remote TernakService.IsiPakan tidak ditemukan")
+        return false
+    end
+
+    local okCall, result = pcall(function()
+        return rf:InvokeServer(slot)
+    end)
+
+    if okCall and type(result) == "table" and result.ok then
+        TernakState.FillCount += 1
+        TernakState.LastStok = result.stok
+        TernakState.LastJumlah = result.jumlah
+        TernakState.LastNama = tostring(result.nama or "-")
+        print(string.format("[IsiPakan] Slot %s OK | %s stok: %s | jumlah: %s",
+            tostring(slot), TernakState.LastNama, tostring(result.stok), tostring(result.jumlah)))
+        return true
+    end
+
+    TernakState.SkipCount += 1
+    warn(string.format("[IsiPakan] Slot %s gagal/ditolak server", tostring(slot)))
+    if not okCall then
+        warn("[AutoPakan Error]:", result)
+    elseif type(result) == "table" and result.stok ~= nil then
+        TernakState.LastStok = result.stok
+    end
+    return false
+end
+
+local function startTernakWorker()
+    if ternakThread then return end
+    ternakThread = task.spawn(function()
+        while TernakState.Running and isScriptRunning do
+            for _, slot in ipairs(TernakConfig.Slots) do
+                if not TernakState.Running or not isScriptRunning then break end
+                for call = 1, TernakConfig.CallsPerSlot do
+                    if not TernakState.Running or not isScriptRunning then break end
+                    feedSlot(slot)
+                    onTernakUpdate()
+                    if call < TernakConfig.CallsPerSlot then
+                        task.wait(TernakConfig.RepeatDelay)
+                    end
+                end
+                task.wait(TernakConfig.CallDelay)
+            end
+            task.wait(TernakConfig.Interval)
+        end
+        ternakThread = nil
+    end)
+end
+
+local function stopTernakWorker()
+    TernakState.Running = false
+    if ternakThread then
+        task.cancel(ternakThread)
+        ternakThread = nil
+    end
+end
+
+-- Isi pakan manual: semua slot, sekali jalan, dari mana saja (tanpa mendekat/teleport)
+-- Return: jumlah panggilan ok, total panggilan
+local function feedAllOnce()
+    local okCount, total = 0, 0
+    for _, slot in ipairs(TernakConfig.Slots) do
+        for call = 1, TernakConfig.CallsPerSlot do
+            if not isScriptRunning then return okCount, total end
+            total += 1
+            if feedSlot(slot) then okCount += 1 end
+            onTernakUpdate()
+            if call < TernakConfig.CallsPerSlot then
+                task.wait(TernakConfig.RepeatDelay)
+            end
+        end
+        task.wait(TernakConfig.CallDelay)
+    end
+    return okCount, total
+end
+
+-- ========================================================
 -- HIGH-END CYBER GUI DESIGN (SMITH GANTENG)
 -- ========================================================
 -- Ukuran GUI sedang (menyesuaikan layar, tidak lebih kecil dari 340x445)
@@ -1287,7 +1558,7 @@ TabListLayout.Padding = UDim.new(0, 6)
 
 local function createTabPill(title)
     local btn = Instance.new("TextButton")
-    btn.Size = UDim2.new(1 / 4, -6, 1, -6)
+    btn.Size = UDim2.new(1 / 5, -6, 1, -6)
     btn.BackgroundColor3 = Color3.fromRGB(20, 22, 32)
     btn.BorderSizePixel = 0
     btn.Font = Enum.Font.GothamBold
@@ -1308,6 +1579,7 @@ local TabPlantBtn = createTabPill("🌱 PLANT")
 local TabCleanBtn = createTabPill("🧹 CLEAN")
 local TabTenantBtn = createTabPill("🏠 SEWA")
 local TabAfkBtn   = createTabPill("🛡️ AFK")
+local TabTernakBtn = createTabPill("🐑 TERNAK")
 
 -- ========================================================
 -- CONTENT CONTAINER
@@ -2006,6 +2278,194 @@ do
 end
 
 -- ========================================================
+-- TERNAK PAGE (AUTO ISI PAKAN DOMBA)
+-- ========================================================
+local TernakPage = Instance.new("Frame")
+TernakPage.Name = "TernakPage"
+TernakPage.Size = UDim2.new(1, 0, 1, 0)
+TernakPage.BackgroundTransparency = 1
+TernakPage.Visible = false
+TernakPage.Parent = ContentFrame
+
+do
+    local statusCard = createModernCard(TernakPage, 48, 0)
+
+    local icon = Instance.new("TextLabel")
+    icon.Size = UDim2.new(0, 24, 0, 24)
+    icon.Position = UDim2.new(0, 12, 0.5, -12)
+    icon.BackgroundTransparency = 1
+    icon.Font = Enum.Font.GothamBold
+    icon.Text = "🐑"
+    icon.TextSize = 16
+    icon.Parent = statusCard
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, -120, 0, 16)
+    title.Position = UDim2.new(0, 42, 0, 8)
+    title.BackgroundTransparency = 1
+    title.Font = Enum.Font.GothamBold
+    title.Text = "Auto Isi Pakan Domba"
+    title.TextColor3 = Color3.fromRGB(240, 240, 250)
+    title.TextSize = 11
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Parent = statusCard
+
+    local sub = Instance.new("TextLabel")
+    sub.Size = UDim2.new(1, -120, 0, 14)
+    sub.Position = UDim2.new(0, 42, 0, 25)
+    sub.BackgroundTransparency = 1
+    sub.Font = Enum.Font.Gotham
+    sub.Text = "Isi: 0 | Skip: 0 | Stok: -"
+    sub.TextColor3 = Color3.fromRGB(140, 145, 165)
+    sub.TextSize = 10
+    sub.TextXAlignment = Enum.TextXAlignment.Left
+    sub.Parent = statusCard
+
+    local badge = Instance.new("Frame")
+    badge.Size = UDim2.new(0, 68, 0, 22)
+    badge.Position = UDim2.new(1, -78, 0.5, -11)
+    badge.BackgroundColor3 = Color3.fromRGB(30, 33, 46)
+    badge.BorderSizePixel = 0
+    badge.Parent = statusCard
+    Instance.new("UICorner", badge).CornerRadius = UDim.new(0, 6)
+
+    local badgeText = Instance.new("TextLabel")
+    badgeText.Size = UDim2.new(1, 0, 1, 0)
+    badgeText.BackgroundTransparency = 1
+    badgeText.Font = Enum.Font.GothamBold
+    badgeText.Text = "● OFF"
+    badgeText.TextColor3 = Color3.fromRGB(160, 165, 185)
+    badgeText.TextSize = 9
+    badgeText.Parent = badge
+
+    -- Card input: slot & interval
+    local inputsCard = createModernCard(TernakPage, 90, 54)
+
+    local function makeInput(name, placeholder, defaultValue, labelText, posY)
+        local lbl = Instance.new("TextLabel")
+        lbl.Size = UDim2.new(1, -24, 0, 12)
+        lbl.Position = UDim2.new(0, 12, 0, posY)
+        lbl.BackgroundTransparency = 1
+        lbl.Font = Enum.Font.GothamBold
+        lbl.Text = labelText
+        lbl.TextColor3 = Color3.fromRGB(99, 102, 241)
+        lbl.TextSize = 8
+        lbl.TextXAlignment = Enum.TextXAlignment.Left
+        lbl.Parent = inputsCard
+
+        local box = Instance.new("TextBox")
+        box.Name = name
+        box.Size = UDim2.new(1, -24, 0, 24)
+        box.Position = UDim2.new(0, 12, 0, posY + 14)
+        box.BackgroundColor3 = Color3.fromRGB(15, 16, 24)
+        box.BorderSizePixel = 0
+        box.TextColor3 = Color3.fromRGB(240, 240, 250)
+        box.Text = tostring(defaultValue)
+        box.PlaceholderText = placeholder
+        box.PlaceholderColor3 = Color3.fromRGB(100, 105, 125)
+        box.Font = Enum.Font.Gotham
+        box.TextSize = 10
+        box.ClearTextOnFocus = false
+        box.Parent = inputsCard
+        Instance.new("UICorner", box).CornerRadius = UDim.new(0, 5)
+        local bStroke = Instance.new("UIStroke", box)
+        bStroke.Color = Color3.fromRGB(42, 46, 66)
+        bStroke.Thickness = 1
+
+        table.insert(Connections, box.Focused:Connect(function()
+            TweenService:Create(bStroke, TWEEN_FAST, { Color = Color3.fromRGB(99, 102, 241) }):Play()
+        end))
+        table.insert(Connections, box.FocusLost:Connect(function()
+            TweenService:Create(bStroke, TWEEN_FAST, { Color = Color3.fromRGB(42, 46, 66) }):Play()
+        end))
+        return box
+    end
+
+    local slotsText = table.concat(TernakConfig.Slots, ",")
+    local SlotInput = makeInput("SlotInput", "Contoh: 1,2,3", slotsText, "SLOT KANDANG (PISAH KOMA):", 4)
+    local IntervalInput = makeInput("PakanIntervalInput", "Detik antar siklus", TernakConfig.Interval, "INTERVAL ISI (DETIK):", 46)
+
+    table.insert(Connections, SlotInput.FocusLost:Connect(function()
+        local slots = {}
+        for token in string.gmatch(SlotInput.Text, "%d+") do
+            local n = tonumber(token)
+            if n and n >= 1 then table.insert(slots, n) end
+        end
+        if #slots > 0 then
+            TernakConfig.Slots = slots
+        end
+        SlotInput.Text = table.concat(TernakConfig.Slots, ",")
+    end))
+
+    table.insert(Connections, IntervalInput.FocusLost:Connect(function()
+        local n = tonumber(IntervalInput.Text)
+        if n then
+            TernakConfig.Interval = math.clamp(n, 0.5, 600)
+        end
+        IntervalInput.Text = tostring(TernakConfig.Interval)
+    end))
+
+    local toggleBtn, toggleGrad = createHeroToggle(TernakPage, "ToggleTernakBtn", "▶  START AUTO ISI PAKAN", -44)
+
+    -- Tombol isi pakan manual (sekali tekan, tanpa harus mendekat)
+    local FEED_NOW_TEXT = "🍽️  ISI PAKAN SEKARANG (TANPA MENDEKAT)"
+    local feedBtn, feedGrad = createHeroToggle(TernakPage, "FeedNowBtn", FEED_NOW_TEXT, -92)
+    feedGrad.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(99, 102, 241)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(59, 130, 246))
+    })
+
+    local feedBusy = false
+    table.insert(Connections, feedBtn.Activated:Connect(function()
+        if feedBusy then return end
+        feedBusy = true
+        task.spawn(function()
+            feedBtn.Text = "⏳  MENGISI PAKAN..."
+            local okCount, total = feedAllOnce()
+            onTernakUpdate()
+            if isScriptRunning then
+                feedBtn.Text = string.format("✔  SELESAI (%d/%d BERHASIL)", okCount, total)
+                task.wait(1.5)
+                feedBtn.Text = FEED_NOW_TEXT
+            end
+            feedBusy = false
+        end)
+    end))
+
+    onTernakUpdate = function()
+        sub.Text = string.format("Isi: %d | Skip: %d | Stok %s: %s",
+            TernakState.FillCount, TernakState.SkipCount,
+            TernakState.LastNama, TernakState.LastStok ~= nil and tostring(TernakState.LastStok) or "-")
+    end
+
+    table.insert(Connections, toggleBtn.Activated:Connect(function()
+        TernakState.Running = not TernakState.Running
+
+        if TernakState.Running then
+            toggleGrad.Color = ColorSequence.new({
+                ColorSequenceKeypoint.new(0, Color3.fromRGB(52, 211, 153)),
+                ColorSequenceKeypoint.new(1, Color3.fromRGB(16, 185, 129))
+            })
+            toggleBtn.Text = "■  STOP AUTO ISI PAKAN (RUNNING)"
+            badgeText.Text = "● ACTIVE"
+            badgeText.TextColor3 = Color3.fromRGB(52, 211, 153)
+            badge.BackgroundColor3 = Color3.fromRGB(20, 45, 35)
+            startTernakWorker()
+        else
+            toggleGrad.Color = ColorSequence.new({
+                ColorSequenceKeypoint.new(0, Color3.fromRGB(244, 63, 94)),
+                ColorSequenceKeypoint.new(1, Color3.fromRGB(225, 29, 72))
+            })
+            toggleBtn.Text = "▶  START AUTO ISI PAKAN"
+            badgeText.Text = "● OFF"
+            badgeText.TextColor3 = Color3.fromRGB(160, 165, 185)
+            badge.BackgroundColor3 = Color3.fromRGB(30, 33, 46)
+            stopTernakWorker()
+        end
+    end))
+end
+
+-- ========================================================
 -- FOOTER BAR (CREDIT: SMITH GANTENG)
 -- ========================================================
 local Footer = Instance.new("Frame")
@@ -2042,6 +2502,7 @@ local TAB_MAP = {
     Clean = { page = CleanPage, btn = TabCleanBtn },
     Tenant = { page = TenantPage, btn = TabTenantBtn },
     Afk   = { page = AfkPage,   btn = TabAfkBtn },
+    Ternak = { page = TernakPage, btn = TabTernakBtn },
 }
 
 local function switchTab(tab)
@@ -2062,6 +2523,7 @@ table.insert(Connections, TabPlantBtn.Activated:Connect(function() switchTab("Pl
 table.insert(Connections, TabCleanBtn.Activated:Connect(function() switchTab("Clean") end))
 table.insert(Connections, TabTenantBtn.Activated:Connect(function() switchTab("Tenant") end))
 table.insert(Connections, TabAfkBtn.Activated:Connect(function() switchTab("Afk") end))
+table.insert(Connections, TabTernakBtn.Activated:Connect(function() switchTab("Ternak") end))
 
 -- ========================================================
 -- LOGIC HANDLERS & ANIMATIONS
@@ -2274,6 +2736,7 @@ local function shutdown()
     pcall(stopTenantWorker)
     pcall(stopSpinWatcher)
     pcall(stopAntiAfk)
+    pcall(stopTernakWorker)
 
     for _, conn in ipairs(Connections) do
         if conn and conn.Disconnect then pcall(function() conn:Disconnect() end) end
