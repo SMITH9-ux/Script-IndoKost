@@ -1,17 +1,4 @@
---[[
-    ╔═══════════════════════════════════════════════════════════════╗
-    ║                 ⚡ INDO-KOST ULTRA HUB v2.5 ⚡                 ║
-    ║                    👑 SMITH GANTENG 👑                        ║
-    ║       Modern Cyber Dark Edition - All-In-One Automation       ║
-    ║  - Auto Plant: Multi-Plot Selection                           ║
-    ║  - Auto Clean: Remote Signal + Auto Prompt + TP Jarak Jauh    ║
-    ║  - Anti-AFK: Cegah Kick Idle 20 Menit (Tombol Terpisah)       ║
-    ║  - Alur Clean: Bersih > Tunggu Sampah > Ambil > Buang         ║
-    ║  - Kompatibel multi-executor (fallback otomatis)              ║
-    ║  - Auto Acc Penyewa + Spin Gratis saat 10 Penyewa (Terpisah)  ║
-    ║  - High-End Glassmorphism UI with UIGradient & Micro-Tweens   ║
-    ╚═══════════════════════════════════════════════════════════════╝
---]]
+
 
 -- SERVICES
 local Players = game:GetService("Players")
@@ -42,6 +29,8 @@ local PlantConfig = {
     INTER_ACTION_DELAY = 0.15,
     CYCLE_COOLDOWN = 0.10,
     DEFAULT_LAHAN = "Semua Lahan",
+    USE_TELEPORT = true, -- Auto TP: teleport ke tiap plot sebelum menanam
+    TP_SETTLE_DELAY = 0.05, -- jeda singkat setelah teleport sebelum tanam
     PLOT4_RADIUS = 1000 -- radius (studs) auto plant khusus Plot 4; plot di luar radius dilewati
 }
 
@@ -613,7 +602,8 @@ local function executePlantCycle()
 
     -- Radius khusus Plot 4: hanya tanam plot yang berjarak <= PLOT4_RADIUS dari karakter
     local lahanName = LAHAN_CATEGORIES[currentLahanIndex] or ""
-    if string.sub(lahanName, 1, 6) == "Plot 4" then
+    -- (dilewati bila Auto TP aktif, karena karakter akan teleport ke plotnya sendiri)
+    if not PlantConfig.USE_TELEPORT and string.sub(lahanName, 1, 6) == "Plot 4" then
         local char = LocalPlayer.Character
         local hrp = char and char:FindFirstChild("HumanoidRootPart")
         if hrp then
@@ -645,6 +635,12 @@ local function executePlantCycle()
 
     for index, plotPos in ipairs(activePlots) do
         if not isPlantRunning or not isScriptRunning then break end
+
+        if PlantConfig.USE_TELEPORT then
+            safeTeleport(plotPos)
+            task.wait(PlantConfig.TP_SETTLE_DELAY)
+            if not isPlantRunning or not isScriptRunning then break end
+        end
 
         if tanamRF then
             local plantSuccess, plantErr = pcall(function()
@@ -1481,6 +1477,34 @@ ConfigInfoLabel.TextSize = 9
 ConfigInfoLabel.TextXAlignment = Enum.TextXAlignment.Center
 ConfigInfoLabel.Parent = PlantConfigCard
 
+-- Card 4: Toggle Auto TP (Plant)
+local PlantTpCard = createModernCard(PlantPage, 40, 182)
+
+local PlantTpLabel = Instance.new("TextLabel")
+PlantTpLabel.Size = UDim2.new(1, -90, 1, 0)
+PlantTpLabel.Position = UDim2.new(0, 12, 0, 0)
+PlantTpLabel.BackgroundTransparency = 1
+PlantTpLabel.Font = Enum.Font.GothamBold
+PlantTpLabel.Text = "🚀 Auto TP ke Plot"
+PlantTpLabel.TextColor3 = Color3.fromRGB(230, 230, 245)
+PlantTpLabel.TextSize = 10
+PlantTpLabel.TextXAlignment = Enum.TextXAlignment.Left
+PlantTpLabel.Parent = PlantTpCard
+
+local TpPlantBtn = Instance.new("TextButton")
+TpPlantBtn.Name = "TpPlantBtn"
+TpPlantBtn.Size = UDim2.new(0, 60, 0, 24)
+TpPlantBtn.Position = UDim2.new(1, -72, 0.5, -12)
+TpPlantBtn.BackgroundColor3 = PlantConfig.USE_TELEPORT and Color3.fromRGB(16, 185, 129) or Color3.fromRGB(45, 48, 65)
+TpPlantBtn.BorderSizePixel = 0
+TpPlantBtn.Font = Enum.Font.GothamBold
+TpPlantBtn.Text = PlantConfig.USE_TELEPORT and "ON" or "OFF"
+TpPlantBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+TpPlantBtn.TextSize = 10
+TpPlantBtn.AutoButtonColor = false
+TpPlantBtn.Parent = PlantTpCard
+Instance.new("UICorner", TpPlantBtn).CornerRadius = UDim.new(0, 6)
+
 -- Toggle Auto Plant Hero Button
 local TogglePlantBtn = Instance.new("TextButton")
 TogglePlantBtn.Name = "TogglePlantBtn"
@@ -2067,6 +2091,14 @@ table.insert(Connections, LahanDisplayBtn.Activated:Connect(function()
     currentLahanIndex = currentLahanIndex + 1
     if currentLahanIndex > #LAHAN_CATEGORIES then currentLahanIndex = 1 end
     updateLahanDisplay()
+end))
+
+-- Toggle Auto TP Button (Plant)
+table.insert(Connections, TpPlantBtn.Activated:Connect(function()
+    PlantConfig.USE_TELEPORT = not PlantConfig.USE_TELEPORT
+    local col = PlantConfig.USE_TELEPORT and Color3.fromRGB(16, 185, 129) or Color3.fromRGB(45, 48, 65)
+    TweenService:Create(TpPlantBtn, TWEEN_FAST, { BackgroundColor3 = col }):Play()
+    TpPlantBtn.Text = PlantConfig.USE_TELEPORT and "ON" or "OFF"
 end))
 
 -- Toggle Jarak Jauh Button (Clean)
