@@ -1,17 +1,4 @@
---[[
-    ╔═══════════════════════════════════════════════════════════════╗
-    ║                 ⚡ INDO-KOST ULTRA HUB v2.5 ⚡                 ║
-    ║                    👑 SMITH GANTENG 👑                        ║
-    ║       Modern Cyber Dark Edition - All-In-One Automation       ║
-    ║  - Auto Plant: Multi-Plot Selection + Auto TP ke Plot         ║
-    ║  - Auto Clean: Remote Signal + Auto Prompt + TP Jarak Jauh    ║
-    ║  - Anti-AFK: Cegah Kick Idle 20 Menit (Tombol Terpisah)       ║
-    ║  - Alur Clean: Bersih > Tunggu Sampah > Ambil > Buang         ║
-    ║  - Kompatibel multi-executor (fallback otomatis)              ║
-    ║  - Auto Acc Penyewa + Spin Gratis saat 10 Penyewa (Terpisah)  ║
-    ║  - High-End Glassmorphism UI with UIGradient & Micro-Tweens   ║
-    ╚═══════════════════════════════════════════════════════════════╝
---]]
+
 
 -- SERVICES
 local Players = game:GetService("Players")
@@ -1231,125 +1218,880 @@ local function stopAntiAfk()
     end
 end
 
--- ========================================================
--- AUTO ISI PAKAN DOMBA (TernakService.IsiPakan)
--- ========================================================
-local TernakConfig = {
-    Slots = { 1, 2 },   -- nomor kandang/slot domba yang diisi pakannya
-    Interval = 5,       -- detik antar siklus (satu siklus = isi semua slot)
-    CallsPerSlot = 2,   -- tiap slot dipanggil 2x berturut-turut (sesuai log: 1,1,2,2)
-    RepeatDelay = 0.15, -- detik antar pemanggilan di slot yang sama
-    CallDelay = 0.3     -- detik antar slot dalam satu siklus
-}
+-- Semua logika ternak/traktor/kotoran/rute dibungkus satu fungsi agar tidak
+-- melebihi batas 200 variabel local di tingkat atas. Antarmuka lewat tabel TernakHub.
+local TernakHub = (function()
+    local cb = {
+        traktor = function() end,
+        dung = function() end,
+        route = function() end,
+        convert = function() end
+    }
+    local RunService = game:GetService("RunService")
 
-local TernakState = {
-    Running = false,
-    FillCount = 0,      -- jumlah isi pakan yang berhasil (ok = true)
-    SkipCount = 0,      -- ditolak server (mis. pakan masih penuh / stok habis)
-    LastStok = nil,
-    LastJumlah = nil,
-    LastNama = "-"
-}
+    -- ========================================================
+    -- AUTO SPAWN & MENGEMUDI TRAKTOR (TraktorService)
+    -- Dua fitur terpisah: Auto Spawn dan Auto Mengemudi punya tombol ON/OFF masing-masing
+    -- ========================================================
+    local TraktorConfig = {
+        VehicleType = "Traktor",  -- argumen pertama Spawn
+        SpawnInterval = 5,        -- detik cek traktor sudah ada atau belum
+        SpawnWaitTimeout = 5,     -- detik menunggu traktor muncul setelah Spawn
+        DriveInterval = 3,        -- detik cek perlu mulai mengemudi atau tidak
+        AutoBoard = true,         -- TP ke traktor lalu duduk di kursinya sebelum MulaiMengemudi
+        BoardSettleDelay = 0.3,   -- jeda setelah TP / mencoba duduk sebelum dicek
+        BoardRetries = 3          -- jumlah percobaan naik per traktor
+    }
 
-local pakanRF = nil
-local ternakThread = nil
-local onTernakUpdate = function() end -- diisi oleh GUI
+    local TraktorState = {
+        SpawnRunning = false,
+        DriveRunning = false,
+        SpawnCount = 0,
+        DriveCount = 0,
+        LastDrivenModel = nil,   -- traktor terakhir yang sudah dikemudikan
+        LastDrivenChar = nil     -- karakter saat itu (bila respawn, mengemudi diulang)
+    }
 
-local function getPakanRemote()
-    if pakanRF and pakanRF.Parent then return pakanRF end
-    pcall(function()
-        pakanRF = ReplicatedStorage
-            :WaitForChild("NKSystem", 5)
-            :WaitForChild("Packages", 5)
-            :WaitForChild("Knit", 5)
-            :WaitForChild("Services", 5)
-            :WaitForChild("TernakService", 5)
-            :WaitForChild("RF", 5)
-            :WaitForChild("IsiPakan", 5)
-    end)
-    return pakanRF
-end
+    local traktorSpawnThread = nil
+    local traktorDriveThread = nil
+    local traktorRemotes = {}
 
--- Isi pakan satu slot. Return true bila server menjawab ok = true
-local function feedSlot(slot)
-    local rf = getPakanRemote()
-    if not rf then
-        warn("[AutoPakan]: Remote TernakService.IsiPakan tidak ditemukan")
+    local function getTraktorRemote(kind, name)
+        local key = kind .. "." .. name
+        local cached = traktorRemotes[key]
+        if cached and cached.Parent then return cached end
+
+        local ok, remote = pcall(function()
+            return ReplicatedStorage
+                :WaitForChild("NKSystem", 5)
+                :WaitForChild("Packages", 5)
+                :WaitForChild("Knit", 5)
+                :WaitForChild("Services", 5)
+                :WaitForChild("TraktorService", 5)
+                :WaitForChild(kind, 5)
+                :WaitForChild(name, 5)
+        end)
+        if ok and remote then
+            traktorRemotes[key] = remote
+            return remote
+        end
+        return nil
+    end
+
+    -- Traktor milik sendiri: workspace.KendaraanTraktor.Traktor_<UserId>
+    local function findMyTraktor()
+        local folder = Workspace:FindFirstChild("KendaraanTraktor")
+        if not folder then return nil end
+
+        local exact = folder:FindFirstChild("Traktor_" .. tostring(LocalPlayer.UserId))
+        if exact then return exact end
+
+        local tokens = ownerTokens()
+        for _, child in ipairs(folder:GetChildren()) do
+            local lname = string.lower(child.Name)
+            for _, tk in ipairs(tokens) do
+                if string.find(lname, tk, 1, true) then return child end
+            end
+        end
+        return nil
+    end
+
+    -- Pengaturan rute menyetir + nama model traktor yang dikemudikan
+    local RouteConfig = {
+        ModelName = "Traktor_Kotoran", -- nama/id model di workspace.KendaraanTraktor (nama persis, atau awalan + ID kita)
+        -- Profil rute (satu aktif sekali waktu karena memakai traktor yang sama):
+        Profiles = {
+            { -- 1: rute awal, Kandang_1 .. Kandang_4
+                Name = "Rute",
+                KandangNames = { "Kandang_1", "Kandang_2", "Kandang_3", "Kandang_4" },
+                KandangSelected = { true, true, true, true }, -- diubah lewat tombol di tab Ternak
+                PlotKeywords = {}
+            },
+            { -- 2: rute Plot 8, Kandang_1 .. Kandang_8
+                Name = "Plot 8",
+                KandangNames = { "Kandang_1", "Kandang_2", "Kandang_3", "Kandang_4",
+                                 "Kandang_5", "Kandang_6", "Kandang_7", "Kandang_8" },
+                KandangSelected = { true, true, true, true, true, true, true, true },
+                -- Bila nama Kandang_N sama di beberapa plot: utamakan yang berada di bawah objek
+                -- bernama mengandung kata kunci ini (huruf kecil). Hanya preferensi, bukan syarat.
+                PlotKeywords = { "plot 8", "plot_8", "plot8" }
+            }
+        },
+        Speed = 25,             -- studs/detik
+        TurnSpeed = 6,          -- kecepatan menghadap arah jalan (makin besar makin cepat)
+        ArriveDistance = 4,     -- jarak (studs) dianggap sudah sampai di kandang
+        DwellTime = 1.5,        -- detik berhenti di tiap kandang sebelum lanjut
+        Loop = true,            -- true = ulangi terus (kandang terakhir -> pertama)
+        StartAtNearest = true,  -- mulai dari kandang terpilih yang terdekat
+        UseTargetY = false,     -- true = ikuti Y tujuan; false = pertahankan tinggi traktor sekarang
+        HeightOffset = 0,       -- tambahan tinggi bila UseTargetY = true
+        RequireSeated = true,   -- hanya gerak bila karakter duduk di traktor (agar posisi tersinkron ke server)
+        AutoStartDrive = true   -- bila belum duduk, jalankan MulaiMengemudi otomatis (sekali per traktor)
+    }
+
+    -- Traktor yang dikemudikan: milik sendiri berawalan ModelName > nama persis ModelName > Traktor_<UserId>
+    local function findDriveTraktor()
+        local folder = Workspace:FindFirstChild("KendaraanTraktor")
+        if not folder then return nil end
+
+        local want = string.lower(RouteConfig.ModelName)
+        local tokens = ownerTokens()
+        local exactMatch, ownedMatch = nil, nil
+
+        for _, child in ipairs(folder:GetChildren()) do
+            local lname = string.lower(child.Name)
+            if lname == want then
+                exactMatch = child
+            elseif string.find(lname, want, 1, true) == 1 and isOwnedByMe(child, tokens) then
+                ownedMatch = child
+            end
+        end
+
+        return ownedMatch or exactMatch or findMyTraktor()
+    end
+
+    local function spawnTraktor()
+        local rf = getTraktorRemote("RF", "Spawn")
+        if not rf then
+            warn("[Traktor] Remote TraktorService.Spawn tidak ditemukan")
+            return false
+        end
+
+        local okCall, result = pcall(function()
+            return rf:InvokeServer(TraktorConfig.VehicleType, nil)
+        end)
+
+        if okCall and type(result) == "table" and result.ok then
+            TraktorState.SpawnCount += 1
+            print("[Traktor] Spawn OK")
+            return true
+        end
+
+        warn("[Traktor] Spawn gagal/ditolak server")
         return false
     end
 
-    local okCall, result = pcall(function()
-        return rf:InvokeServer(slot)
-    end)
+    local function driveTraktor(model)
+        if typeof(firesignal) ~= "function" then
+            warn("[Traktor] Executor tidak mendukung firesignal, mengemudi otomatis tidak bisa dijalankan")
+            return false
+        end
 
-    if okCall and type(result) == "table" and result.ok then
-        TernakState.FillCount += 1
-        TernakState.LastStok = result.stok
-        TernakState.LastJumlah = result.jumlah
-        TernakState.LastNama = tostring(result.nama or "-")
-        print(string.format("[IsiPakan] Slot %s OK | %s stok: %s | jumlah: %s",
-            tostring(slot), TernakState.LastNama, tostring(result.stok), tostring(result.jumlah)))
+        local re = getTraktorRemote("RE", "MulaiMengemudi")
+        if not re then
+            warn("[Traktor] Remote TraktorService.MulaiMengemudi tidak ditemukan")
+            return false
+        end
+
+        local okFire, err = pcall(function()
+            firesignal(re.OnClientEvent, model, {})
+        end)
+        if not okFire then
+            warn("[Traktor Error]:", err)
+            return false
+        end
+
+        TraktorState.DriveCount += 1
+        print("[Traktor] Mulai mengemudi: " .. model.Name)
         return true
     end
 
-    TernakState.SkipCount += 1
-    warn(string.format("[IsiPakan] Slot %s gagal/ditolak server", tostring(slot)))
-    if not okCall then
-        warn("[AutoPakan Error]:", result)
-    elseif type(result) == "table" and result.stok ~= nil then
-        TernakState.LastStok = result.stok
-    end
-    return false
-end
+    -- TP ke traktor yang di-spawn lalu duduk di kursinya.
+    -- Return true bila sudah duduk (atau bila tidak ada kursi/prompt yang bisa dicek)
+    local function boardTraktor(model)
+        local char = LocalPlayer.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        if not hrp or not hum then return false end
 
-local function startTernakWorker()
-    if ternakThread then return end
-    ternakThread = task.spawn(function()
-        while TernakState.Running and isScriptRunning do
-            for _, slot in ipairs(TernakConfig.Slots) do
-                if not TernakState.Running or not isScriptRunning then break end
-                for call = 1, TernakConfig.CallsPerSlot do
-                    if not TernakState.Running or not isScriptRunning then break end
-                    feedSlot(slot)
-                    onTernakUpdate()
-                    if call < TernakConfig.CallsPerSlot then
-                        task.wait(TernakConfig.RepeatDelay)
+        local function seated()
+            return hum.SeatPart ~= nil and hum.SeatPart:IsDescendantOf(model)
+        end
+        if seated() then return true end -- sudah duduk, jangan TP (TP melepas dari kursi)
+
+        local seat = model:FindFirstChildWhichIsA("VehicleSeat", true) or model:FindFirstChildWhichIsA("Seat", true)
+        local prompt = model:FindFirstChildWhichIsA("ProximityPrompt", true)
+        local basePos = seat and seat.Position or model:GetPivot().Position
+
+        if not seat and not prompt then
+            -- Kursi/prompt tidak terdeteksi: cukup TP ke traktor, sisanya ditangani MulaiMengemudi
+            safeTeleport(basePos)
+            task.wait(TraktorConfig.BoardSettleDelay)
+            return true
+        end
+
+        for _ = 1, TraktorConfig.BoardRetries do
+            if not isScriptRunning then return false end
+
+            safeTeleport(basePos)
+            task.wait(TraktorConfig.BoardSettleDelay)
+
+            if seat then
+                pcall(function() seat:Sit(hum) end) -- bila API tersedia di executor/game
+                pcall(function() hrp.CFrame = seat.CFrame * CFrame.new(0, 2, 0) end) -- menyentuh kursi -> duduk otomatis
+                task.wait(TraktorConfig.BoardSettleDelay)
+                if seated() then break end
+            end
+
+            if prompt and prompt.Enabled then
+                pcall(function()
+                    prompt.RequiresLineOfSight = false
+                    prompt.MaxActivationDistance = 999999
+                    prompt.HoldDuration = 0
+                end)
+                pcall(firePrompt, prompt)
+                task.wait(TraktorConfig.BoardSettleDelay)
+                if seated() then break end
+            end
+        end
+
+        if seated() then
+            print("[Traktor] Duduk di traktor: " .. model.Name)
+            return true
+        end
+        warn("[Traktor] Gagal naik ke traktor " .. model.Name .. " (kursi/prompt tidak merespons)")
+        return false
+    end
+
+    -- Naik traktor (bila AutoBoard) lalu mulai mengemudi
+    local function startDriving(model)
+        if TraktorConfig.AutoBoard and not boardTraktor(model) then
+            return false
+        end
+        return driveTraktor(model)
+    end
+
+    local function startTraktorSpawnWorker()
+        if traktorSpawnThread then return end
+        traktorSpawnThread = task.spawn(function()
+            while TraktorState.SpawnRunning and isScriptRunning do
+                if not findDriveTraktor() then
+                    if spawnTraktor() then
+                        local waited = 0
+                        while TraktorState.SpawnRunning and waited < TraktorConfig.SpawnWaitTimeout and not findDriveTraktor() do
+                            task.wait(0.25)
+                            waited += 0.25
+                        end
+                    end
+                    cb.traktor()
+                end
+                task.wait(TraktorConfig.SpawnInterval)
+            end
+            traktorSpawnThread = nil
+        end)
+    end
+
+    local function stopTraktorSpawnWorker()
+        TraktorState.SpawnRunning = false
+        if traktorSpawnThread then
+            task.cancel(traktorSpawnThread)
+            traktorSpawnThread = nil
+        end
+    end
+
+    local function startTraktorDriveWorker()
+        if traktorDriveThread then return end
+        traktorDriveThread = task.spawn(function()
+            while TraktorState.DriveRunning and isScriptRunning do
+                local model = findDriveTraktor()
+                local char = LocalPlayer.Character
+                -- Mengemudi sekali per traktor / per karakter (hindari memicu event berulang)
+                if model and char and (model ~= TraktorState.LastDrivenModel or char ~= TraktorState.LastDrivenChar) then
+                    if startDriving(model) then
+                        TraktorState.LastDrivenModel = model
+                        TraktorState.LastDrivenChar = char
+                        cb.traktor()
                     end
                 end
-                task.wait(TernakConfig.CallDelay)
+                task.wait(TraktorConfig.DriveInterval)
             end
-            task.wait(TernakConfig.Interval)
-        end
-        ternakThread = nil
-    end)
-end
-
-local function stopTernakWorker()
-    TernakState.Running = false
-    if ternakThread then
-        task.cancel(ternakThread)
-        ternakThread = nil
+            traktorDriveThread = nil
+        end)
     end
-end
 
--- Isi pakan manual: semua slot, sekali jalan, dari mana saja (tanpa mendekat/teleport)
--- Return: jumlah panggilan ok, total panggilan
-local function feedAllOnce()
-    local okCount, total = 0, 0
-    for _, slot in ipairs(TernakConfig.Slots) do
-        for call = 1, TernakConfig.CallsPerSlot do
-            if not isScriptRunning then return okCount, total end
-            total += 1
-            if feedSlot(slot) then okCount += 1 end
-            onTernakUpdate()
-            if call < TernakConfig.CallsPerSlot then
-                task.wait(TernakConfig.RepeatDelay)
+    local function stopTraktorDriveWorker()
+        TraktorState.DriveRunning = false
+        TraktorState.LastDrivenModel = nil
+        TraktorState.LastDrivenChar = nil
+        if traktorDriveThread then
+            task.cancel(traktorDriveThread)
+            traktorDriveThread = nil
+        end
+    end
+
+
+    -- ========================================================
+    -- MASUKKAN KOTORAN KE MESIN CONVERT (ConvertService.Masukkan)
+    -- Dipanggil hanya saat memakai traktor. Tombol ON/OFF terpisah.
+    -- ========================================================
+    local ConvertConfig = {
+        Interval = 3,            -- detik antar pemanggilan Masukkan
+        MinGap = 0.5,            -- jeda minimum antar pemanggilan (agar pemicu dari rute tidak menumpuk)
+        TriggerDelay = 0.3,      -- detik setelah traktor mencapai kotoran sebelum Masukkan dipicu
+        OnlyWhenDriving = true   -- true = hanya saat duduk di traktor
+    }
+
+    local ConvertState = {
+        Running = false,
+        Count = 0,               -- jumlah Masukkan yang berhasil
+        Fail = 0,                -- jumlah yang ditolak/gagal
+        Last = 0,
+        Busy = false,
+        LastSuccess = nil        -- untuk log saat hasil berubah
+    }
+
+    local convertThread = nil
+    local convertRF = nil
+
+    local function getConvertRemote()
+        if convertRF and convertRF.Parent then return convertRF end
+        pcall(function()
+            convertRF = ReplicatedStorage
+                :WaitForChild("NKSystem", 5)
+                :WaitForChild("Packages", 5)
+                :WaitForChild("Knit", 5)
+                :WaitForChild("Services", 5)
+                :WaitForChild("ConvertService", 5)
+                :WaitForChild("RF", 5)
+                :WaitForChild("Masukkan", 5)
+        end)
+        return convertRF
+    end
+
+    -- Sedang memakai traktor milik sendiri (duduk di kursinya)
+    local function drivingNow()
+        local model = findDriveTraktor()
+        if not model then return false end
+        local char = LocalPlayer.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        local seat = hum and hum.SeatPart
+        if seat ~= nil and seat:IsDescendantOf(model) then return true end
+        return not RouteConfig.RequireSeated
+    end
+
+    local function summarizeResult(result)
+        if type(result) ~= "table" then return tostring(result) end
+        local parts, n = {}, 0
+        for k, v in pairs(result) do
+            n += 1
+            if n > 8 then break end
+            table.insert(parts, tostring(k) .. "=" .. tostring(v))
+        end
+        return "{" .. table.concat(parts, ", ") .. "}"
+    end
+
+    -- Masukkan kotoran ke mesin convert. Return true bila server menganggap berhasil
+    local function convertNow()
+        if ConvertState.Busy then return false end
+        if os.clock() - ConvertState.Last < ConvertConfig.MinGap then return false end
+
+        local rf = getConvertRemote()
+        if not rf then
+            warn("[Convert] Remote ConvertService.Masukkan tidak ditemukan")
+            return false
+        end
+
+        ConvertState.Busy = true
+        ConvertState.Last = os.clock()
+        local okCall, result = pcall(function()
+            return rf:InvokeServer()
+        end)
+        ConvertState.Busy = false
+
+        -- Format jawaban belum diketahui: anggap berhasil bila ada jawaban selain nil/false
+        -- dan (bila berupa tabel) field ok tidak bernilai false
+        local success = okCall and result ~= nil and result ~= false
+        if success and type(result) == "table" and result.ok == false then
+            success = false
+        end
+
+        if success then
+            ConvertState.Count += 1
+        else
+            ConvertState.Fail += 1
+        end
+
+        if ConvertState.LastSuccess ~= success then
+            ConvertState.LastSuccess = success
+            local text = okCall and summarizeResult(result) or tostring(result)
+            if success then
+                print("[Convert] Masukkan OK | " .. text)
+            else
+                warn("[Convert] Masukkan ditolak/gagal | " .. text)
             end
         end
-        task.wait(TernakConfig.CallDelay)
+
+        cb.convert()
+        return success
     end
-    return okCount, total
-end
+
+    local function startConvertWorker()
+        if convertThread then return end
+        convertThread = task.spawn(function()
+            while ConvertState.Running and isScriptRunning do
+                if not ConvertConfig.OnlyWhenDriving or drivingNow() then
+                    convertNow()
+                end
+                task.wait(ConvertConfig.Interval)
+            end
+            convertThread = nil
+        end)
+    end
+
+    local function stopConvertWorker()
+        ConvertState.Running = false
+        if convertThread then
+            task.cancel(convertThread)
+            convertThread = nil
+        end
+    end
+
+    -- ========================================================
+    -- DETEKSI KOTORAN KAMBING (SAAT MEMAKAI TRAKTOR)
+    -- Target: objek bernama "Kotoran_Kambing__Kotoran"
+    -- Kotoran yang terdeteksi didatangi lebih dulu oleh Setir Rute (bila aktif)
+    -- ========================================================
+    local DungConfig = {
+        TargetName = "Kotoran_Kambing__Kotoran",
+        FuzzyPrefix = "kotoran_kambing", -- cadangan bila nama persis tidak ada (mis. ada angka/ID tambahan). "" = nonaktif
+        DetectInterval = 1,   -- detik antar pemindaian
+        ArriveDistance = 4,   -- jarak (studs) traktor dianggap sudah sampai di kotoran
+        RetryCooldown = 4,    -- detik sebelum kotoran yang sama dianggap lagi
+        RequireOwned = false, -- true = hanya kotoran milik kosan sendiri
+        OnlyWhenDriving = true -- true = mendeteksi hanya saat sedang memakai traktor
+    }
+
+    local DungState = {
+        Running = false,
+        Detected = 0,         -- jumlah kotoran terdeteksi saat ini
+        Collected = 0,        -- jumlah kotoran yang sudah didatangi traktor
+        Target = nil,         -- kotoran yang sedang dituju
+        LastLogged = nil,
+        Recent = {}
+    }
+
+    local dungThread = nil
+
+    -- Posisi umum sebuah objek (Part / Model / Attachment / Prompt / Folder)
+    local function objPosition(obj)
+        if obj:IsA("BasePart") then return obj.Position end
+        if obj:IsA("Attachment") then return obj.WorldPosition end
+        if obj:IsA("ProximityPrompt") then return promptPosition(obj) end
+        if obj:IsA("Model") then
+            local ok, cf = pcall(function() return obj:GetPivot() end)
+            if ok and cf then return cf.Position end
+        end
+        local sum, n = Vector3.zero, 0
+        for _, d in ipairs(obj:GetDescendants()) do
+            if d:IsA("BasePart") then
+                sum += d.Position
+                n += 1
+            end
+        end
+        return n > 0 and sum / n or nil
+    end
+
+    local function isSeatedIn(model)
+        local char = LocalPlayer.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        local seat = hum and hum.SeatPart
+        return seat ~= nil and seat:IsDescendantOf(model)
+    end
+
+    -- Pindai kotoran: milik sendiri > nama persis > terdekat dari posisi traktor
+    local function scanDung(fromPos)
+        local exactName = string.lower(DungConfig.TargetName)
+        local prefix = DungConfig.FuzzyPrefix ~= "" and string.lower(DungConfig.FuzzyPrefix) or nil
+        local tokens = ownerTokens()
+        local now = os.clock()
+
+        local best, bestOwned, bestQuality, bestDist = nil, false, 0, math.huge
+        local count = 0
+
+        for _, obj in ipairs(Workspace:GetDescendants()) do
+            if obj:IsA("BasePart") or obj:IsA("Model") or obj:IsA("ProximityPrompt") then
+                local lname = string.lower(obj.Name)
+                local quality = 0
+                if lname == exactName then
+                    quality = 2
+                elseif prefix and string.find(lname, prefix, 1, true) == 1 then
+                    quality = 1
+                end
+
+                if quality > 0 then
+                    local recent = DungState.Recent[obj]
+                    if not (recent and now - recent < DungConfig.RetryCooldown) then
+                        local pos = objPosition(obj)
+                        if pos then
+                            local owned = isOwnedByMe(obj, tokens)
+                            if owned or not DungConfig.RequireOwned then
+                                count += 1
+                                local dist = (pos - fromPos).Magnitude
+                                local better
+                                if owned ~= bestOwned then
+                                    better = owned
+                                elseif quality ~= bestQuality then
+                                    better = quality > bestQuality
+                                else
+                                    better = dist < bestDist
+                                end
+                                if not best or better then
+                                    best, bestOwned, bestQuality, bestDist = obj, owned, quality, dist
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+
+        return best, count, bestOwned
+    end
+
+    local function startDungWorker()
+        if dungThread then return end
+        dungThread = task.spawn(function()
+            while DungState.Running and isScriptRunning do
+                local model = findDriveTraktor()
+                local driving = model ~= nil and (isSeatedIn(model) or not RouteConfig.RequireSeated)
+
+                if driving or not DungConfig.OnlyWhenDriving then
+                    local fromPos = nil
+                    if model then
+                        fromPos = model:GetPivot().Position
+                    else
+                        local char = LocalPlayer.Character
+                        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+                        fromPos = hrp and hrp.Position
+                    end
+
+                    if fromPos then
+                        local best, count, owned = scanDung(fromPos)
+                        DungState.Detected = count
+
+                        -- Pertahankan target yang sedang dituju agar tidak berpindah-pindah
+                        local cur = DungState.Target
+                        if not (cur and cur.Parent) then
+                            DungState.Target = best
+                            if best and DungState.LastLogged ~= best then
+                                DungState.LastLogged = best
+                                print(string.format("[Kotoran Kambing] Terdeteksi (%s): %s",
+                                    owned and "cocok owner" or "terdekat", best:GetFullName()))
+                            end
+                        end
+                    end
+                else
+                    DungState.Target = nil
+                    DungState.Detected = 0
+                end
+
+                cb.dung()
+                task.wait(DungConfig.DetectInterval)
+            end
+            dungThread = nil
+        end)
+    end
+
+    local function stopDungWorker()
+        DungState.Running = false
+        if dungThread then
+            task.cancel(dungThread)
+            dungThread = nil
+        end
+        DungState.Target = nil
+        DungState.Detected = 0
+        table.clear(DungState.Recent)
+    end
+
+    -- ========================================================
+    -- AUTO SETIR TRAKTOR KE KANDANG (PILIHAN Kandang_1 .. Kandang_4)
+    -- Prioritas: kotoran terdeteksi > kandang terpilih (berurutan)
+    -- ========================================================
+    local RouteState = {
+        Running = false,
+        Profile = 1,            -- indeks profil rute yang aktif (RouteConfig.Profiles)
+        KIndex = 1,
+        Laps = 0,
+        Finished = false,
+        NeedInit = true,
+        KandangName = nil,
+        KandangPos = nil,
+        WarnedEmpty = false,
+        Logged = {}
+    }
+
+    local routeThread = nil
+
+    local function selectedKandangNames()
+        local list = {}
+        local prof = RouteConfig.Profiles[RouteState.Profile]
+        if not prof then return list end
+        for i, name in ipairs(prof.KandangNames) do
+            if prof.KandangSelected[i] then
+                table.insert(list, name)
+            end
+        end
+        return list
+    end
+
+    -- Apakah salah satu parent objek bernama mengandung kata kunci plot (mis. "plot 8")?
+    local function matchesPlot(obj, keywords)
+        if not keywords or #keywords == 0 then return false end
+        local node = obj.Parent
+        while node and node ~= Workspace and node ~= game do
+            local lname = string.lower(node.Name)
+            for _, kw in ipairs(keywords) do
+                if string.find(lname, kw, 1, true) then return true end
+            end
+            node = node.Parent
+        end
+        return false
+    end
+
+    -- Cari kandang bernama persis (mis. "Kandang_1"): milik sendiri > cocok kata kunci plot > terdekat
+    local function findKandangPos(name, fromPos)
+        local lname = string.lower(name)
+        local tokens = ownerTokens()
+        local prof = RouteConfig.Profiles[RouteState.Profile]
+        local keywords = prof and prof.PlotKeywords or nil
+        local bestPos, bestObj, bestScore, bestDist, bestOwned = nil, nil, -1, math.huge, false
+
+        for _, obj in ipairs(Workspace:GetDescendants()) do
+            if string.lower(obj.Name) == lname and (obj:IsA("BasePart") or obj:IsA("Model") or obj:IsA("Folder")) then
+                local pos = objPosition(obj)
+                if pos then
+                    local owned = isOwnedByMe(obj, tokens)
+                    local score = (owned and 2 or 0) + (matchesPlot(obj, keywords) and 1 or 0)
+                    local dist = (pos - fromPos).Magnitude
+                    if score > bestScore or (score == bestScore and dist < bestDist) then
+                        bestPos, bestObj, bestScore, bestDist, bestOwned = pos, obj, score, dist, owned
+                    end
+                end
+            end
+        end
+
+        local logKey = tostring(RouteState.Profile) .. ":" .. name
+        if bestObj and RouteState.Logged[logKey] ~= bestObj then
+            RouteState.Logged[logKey] = bestObj
+            print(string.format("[Rute Traktor] %s (%s): %s", name,
+                bestOwned and "cocok owner" or "terdekat", bestObj:GetFullName()))
+        end
+        return bestPos
+    end
+
+    -- Satu langkah gerak menuju target. Return true bila sudah sampai.
+    local function stepToward(model, dt, target, arriveDist)
+        local pivot = model:GetPivot()
+        local pos = pivot.Position
+        local goalY = RouteConfig.UseTargetY and (target.Y + RouteConfig.HeightOffset) or pos.Y
+        local goal = Vector3.new(target.X, goalY, target.Z)
+
+        local delta = goal - pos
+        local flat = Vector3.new(delta.X, 0, delta.Z)
+        local dist = RouteConfig.UseTargetY and delta.Magnitude or flat.Magnitude
+        if dist <= arriveDist then
+            return true
+        end
+
+        local stepLen = math.min(RouteConfig.Speed * dt, delta.Magnitude)
+        local newPos = pos + delta.Unit * stepLen
+
+        local rot = pivot.Rotation
+        if flat.Magnitude > 0.1 then
+            local targetRot = CFrame.lookAt(Vector3.zero, flat.Unit, Vector3.yAxis)
+            rot = rot:Lerp(targetRot, math.clamp(dt * RouteConfig.TurnSpeed, 0, 1))
+        end
+
+        model:PivotTo(CFrame.new(newPos) * rot)
+
+        local root = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart", true)
+        if root then
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+        end
+        return false
+    end
+
+    local function routeTick(model)
+        local pos = model:GetPivot().Position
+
+        -- Prioritas 1: kotoran yang terdeteksi
+        if DungState.Running and DungState.Target then
+            local obj = DungState.Target
+            if obj.Parent then
+                local goal = objPosition(obj)
+                if goal then
+                    local dt = RunService.Heartbeat:Wait()
+                    if stepToward(model, dt, goal, DungConfig.ArriveDistance) then
+                        DungState.Recent[obj] = os.clock()
+                        DungState.Target = nil
+                        DungState.Collected += 1
+                        cb.dung()
+                        if ConvertState.Running then
+                            task.delay(ConvertConfig.TriggerDelay, convertNow)
+                        end
+                    end
+                    return
+                end
+            end
+            DungState.Target = nil
+        end
+
+        -- Prioritas 2: kandang terpilih secara berurutan
+        local list = selectedKandangNames()
+        if #list == 0 then
+            if not RouteState.WarnedEmpty then
+                RouteState.WarnedEmpty = true
+                warn("[Rute Traktor] Tidak ada kandang yang dipilih. Pilih minimal satu kandang di tab Ternak")
+            end
+            task.wait(1)
+            return
+        end
+        RouteState.WarnedEmpty = false
+
+        if RouteState.NeedInit then
+            RouteState.NeedInit = false
+            RouteState.KIndex = 1
+            RouteState.KandangPos = nil
+            if RouteConfig.StartAtNearest then
+                local bestI, bestD = 1, math.huge
+                for i, name in ipairs(list) do
+                    local p = findKandangPos(name, pos)
+                    if p then
+                        local d = (p - pos).Magnitude
+                        if d < bestD then
+                            bestI, bestD = i, d
+                        end
+                    end
+                end
+                RouteState.KIndex = bestI
+            end
+        end
+
+        if RouteState.KIndex > #list then RouteState.KIndex = 1 end
+        local name = list[RouteState.KIndex]
+
+        if not RouteState.KandangPos or RouteState.KandangName ~= name then
+            RouteState.KandangName = name
+            RouteState.KandangPos = findKandangPos(name, pos)
+            if not RouteState.KandangPos then
+                warn("[Rute Traktor] " .. name .. " tidak ditemukan di workspace, dilewati")
+                RouteState.KIndex += 1
+                task.wait(1)
+                return
+            end
+        end
+
+        local dt = RunService.Heartbeat:Wait()
+        if stepToward(model, dt, RouteState.KandangPos, RouteConfig.ArriveDistance) then
+            task.wait(RouteConfig.DwellTime)
+            RouteState.KandangPos = nil
+            RouteState.KIndex += 1
+            if RouteState.KIndex > #list then
+                RouteState.Laps += 1
+                if RouteConfig.Loop then
+                    RouteState.KIndex = 1
+                else
+                    RouteState.KIndex = #list
+                    RouteState.Finished = true
+                end
+            end
+            cb.route()
+        end
+    end
+
+    local function startRouteWorker()
+        if routeThread then return end
+        RouteState.NeedInit = true
+        RouteState.Finished = false
+
+        routeThread = task.spawn(function()
+            local warnedSeat = false
+
+            while RouteState.Running and isScriptRunning do
+                local model = findDriveTraktor()
+                local char = LocalPlayer.Character
+
+                if not model or not char then
+                    task.wait(1)
+                else
+                    -- Belum mengemudi: mulai otomatis sekali per traktor/karakter
+                    if RouteConfig.AutoStartDrive and (model ~= TraktorState.LastDrivenModel or char ~= TraktorState.LastDrivenChar) then
+                        if startDriving(model) then
+                            TraktorState.LastDrivenModel = model
+                            TraktorState.LastDrivenChar = char
+                            cb.traktor()
+                            task.wait(1)
+                        end
+                    end
+
+                    if RouteConfig.RequireSeated and not isSeatedIn(model) then
+                        if not warnedSeat then
+                            warnedSeat = true
+                            warn("[Rute Traktor] Karakter belum duduk di traktor. Nyalakan Auto Mengemudi / duduk manual, atau set RouteConfig.RequireSeated = false")
+                        end
+                        task.wait(1)
+                    elseif RouteState.Finished then
+                        task.wait(0.5)
+                    else
+                        warnedSeat = false
+                        routeTick(model)
+                    end
+                end
+            end
+            routeThread = nil
+        end)
+    end
+
+    local function stopRouteWorker()
+        RouteState.Running = false
+        if routeThread then
+            task.cancel(routeThread)
+            routeThread = nil
+        end
+    end
+
+    -- Nyalakan rute profil idx (mematikan profil lain), atau matikan bila profil itu sudah aktif
+    -- Return: indeks profil yang aktif, atau nil bila rute mati
+    local function toggleRouteProfile(idx)
+        if RouteState.Running and RouteState.Profile == idx then
+            stopRouteWorker()
+            return nil
+        end
+        RouteState.Profile = idx
+        RouteState.KIndex = 1
+        RouteState.KandangPos = nil
+        RouteState.KandangName = nil
+        RouteState.Finished = false
+        RouteState.NeedInit = true
+        RouteState.WarnedEmpty = false
+        RouteState.Laps = 0
+        RouteState.Running = true
+        startRouteWorker()
+        return idx
+    end
+
+    return {
+        cb = cb,
+        ConvertState = ConvertState,
+        startConvertWorker = startConvertWorker, stopConvertWorker = stopConvertWorker,
+        TraktorState = TraktorState,
+        startTraktorSpawnWorker = startTraktorSpawnWorker, stopTraktorSpawnWorker = stopTraktorSpawnWorker,
+        startTraktorDriveWorker = startTraktorDriveWorker, stopTraktorDriveWorker = stopTraktorDriveWorker,
+        DungConfig = DungConfig, DungState = DungState,
+        startDungWorker = startDungWorker, stopDungWorker = stopDungWorker,
+        RouteConfig = RouteConfig, RouteState = RouteState,
+        startRouteWorker = startRouteWorker, stopRouteWorker = stopRouteWorker,
+        toggleRouteProfile = toggleRouteProfile,
+        stopAll = function()
+            pcall(stopTraktorSpawnWorker)
+            pcall(stopTraktorDriveWorker)
+            pcall(stopConvertWorker)
+            pcall(stopDungWorker)
+            pcall(stopRouteWorker)
+        end
+    }
+end)()
 
 -- ========================================================
 -- HIGH-END CYBER GUI DESIGN (SMITH GANTENG)
@@ -2278,7 +3020,7 @@ do
 end
 
 -- ========================================================
--- TERNAK PAGE (AUTO ISI PAKAN DOMBA)
+-- TERNAK PAGE (TRAKTOR, KOTORAN, RUTE KANDANG)
 -- ========================================================
 local TernakPage = Instance.new("Frame")
 TernakPage.Name = "TernakPage"
@@ -2287,183 +3029,264 @@ TernakPage.BackgroundTransparency = 1
 TernakPage.Visible = false
 TernakPage.Parent = ContentFrame
 
-do
-    local statusCard = createModernCard(TernakPage, 48, 0)
+local function buildTernakPage()
+    local H = TernakHub
+    local TraktorState = H.TraktorState
+    local ConvertState, startConvertWorker, stopConvertWorker = H.ConvertState, H.startConvertWorker, H.stopConvertWorker
+    local startTraktorSpawnWorker, stopTraktorSpawnWorker = H.startTraktorSpawnWorker, H.stopTraktorSpawnWorker
+    local startTraktorDriveWorker, stopTraktorDriveWorker = H.startTraktorDriveWorker, H.stopTraktorDriveWorker
+    local DungState, startDungWorker, stopDungWorker = H.DungState, H.startDungWorker, H.stopDungWorker
+    local RouteConfig, RouteState = H.RouteConfig, H.RouteState
+    local startRouteWorker, stopRouteWorker = H.startRouteWorker, H.stopRouteWorker
+    local toggleRouteProfile = H.toggleRouteProfile
 
-    local icon = Instance.new("TextLabel")
-    icon.Size = UDim2.new(0, 24, 0, 24)
-    icon.Position = UDim2.new(0, 12, 0.5, -12)
-    icon.BackgroundTransparency = 1
-    icon.Font = Enum.Font.GothamBold
-    icon.Text = "🐑"
-    icon.TextSize = 16
-    icon.Parent = statusCard
+    -- Card: tombol terpisah Auto Spawn Traktor & Auto Mengemudi
+    local traktorCard = createModernCard(TernakPage, 76, 0)
 
-    local title = Instance.new("TextLabel")
-    title.Size = UDim2.new(1, -120, 0, 16)
-    title.Position = UDim2.new(0, 42, 0, 8)
-    title.BackgroundTransparency = 1
-    title.Font = Enum.Font.GothamBold
-    title.Text = "Auto Isi Pakan Domba"
-    title.TextColor3 = Color3.fromRGB(240, 240, 250)
-    title.TextSize = 11
-    title.TextXAlignment = Enum.TextXAlignment.Left
-    title.Parent = statusCard
+    -- Grid 2 kolom x 2 baris: tiap fitur punya tombol ON/OFF sendiri
+    local function makeSwitchRow(col, row, labelText)
+        local posY = 4 + row * 24
 
-    local sub = Instance.new("TextLabel")
-    sub.Size = UDim2.new(1, -120, 0, 14)
-    sub.Position = UDim2.new(0, 42, 0, 25)
-    sub.BackgroundTransparency = 1
-    sub.Font = Enum.Font.Gotham
-    sub.Text = "Isi: 0 | Skip: 0 | Stok: -"
-    sub.TextColor3 = Color3.fromRGB(140, 145, 165)
-    sub.TextSize = 10
-    sub.TextXAlignment = Enum.TextXAlignment.Left
-    sub.Parent = statusCard
-
-    local badge = Instance.new("Frame")
-    badge.Size = UDim2.new(0, 68, 0, 22)
-    badge.Position = UDim2.new(1, -78, 0.5, -11)
-    badge.BackgroundColor3 = Color3.fromRGB(30, 33, 46)
-    badge.BorderSizePixel = 0
-    badge.Parent = statusCard
-    Instance.new("UICorner", badge).CornerRadius = UDim.new(0, 6)
-
-    local badgeText = Instance.new("TextLabel")
-    badgeText.Size = UDim2.new(1, 0, 1, 0)
-    badgeText.BackgroundTransparency = 1
-    badgeText.Font = Enum.Font.GothamBold
-    badgeText.Text = "● OFF"
-    badgeText.TextColor3 = Color3.fromRGB(160, 165, 185)
-    badgeText.TextSize = 9
-    badgeText.Parent = badge
-
-    -- Card input: slot & interval
-    local inputsCard = createModernCard(TernakPage, 90, 54)
-
-    local function makeInput(name, placeholder, defaultValue, labelText, posY)
         local lbl = Instance.new("TextLabel")
-        lbl.Size = UDim2.new(1, -24, 0, 12)
-        lbl.Position = UDim2.new(0, 12, 0, posY)
+        lbl.Size = UDim2.new(0.5, -60, 0, 20)
+        lbl.Position = UDim2.new(col * 0.5, 8, 0, posY)
         lbl.BackgroundTransparency = 1
         lbl.Font = Enum.Font.GothamBold
         lbl.Text = labelText
-        lbl.TextColor3 = Color3.fromRGB(99, 102, 241)
-        lbl.TextSize = 8
+        lbl.TextColor3 = Color3.fromRGB(230, 230, 245)
+        lbl.TextSize = 9
+        lbl.TextTruncate = Enum.TextTruncate.AtEnd
         lbl.TextXAlignment = Enum.TextXAlignment.Left
-        lbl.Parent = inputsCard
+        lbl.Parent = traktorCard
 
-        local box = Instance.new("TextBox")
-        box.Name = name
-        box.Size = UDim2.new(1, -24, 0, 24)
-        box.Position = UDim2.new(0, 12, 0, posY + 14)
-        box.BackgroundColor3 = Color3.fromRGB(15, 16, 24)
-        box.BorderSizePixel = 0
-        box.TextColor3 = Color3.fromRGB(240, 240, 250)
-        box.Text = tostring(defaultValue)
-        box.PlaceholderText = placeholder
-        box.PlaceholderColor3 = Color3.fromRGB(100, 105, 125)
-        box.Font = Enum.Font.Gotham
-        box.TextSize = 10
-        box.ClearTextOnFocus = false
-        box.Parent = inputsCard
-        Instance.new("UICorner", box).CornerRadius = UDim.new(0, 5)
-        local bStroke = Instance.new("UIStroke", box)
-        bStroke.Color = Color3.fromRGB(42, 46, 66)
-        bStroke.Thickness = 1
-
-        table.insert(Connections, box.Focused:Connect(function()
-            TweenService:Create(bStroke, TWEEN_FAST, { Color = Color3.fromRGB(99, 102, 241) }):Play()
-        end))
-        table.insert(Connections, box.FocusLost:Connect(function()
-            TweenService:Create(bStroke, TWEEN_FAST, { Color = Color3.fromRGB(42, 46, 66) }):Play()
-        end))
-        return box
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(0, 44, 0, 20)
+        btn.Position = UDim2.new(col * 0.5 + 0.5, -52, 0, posY)
+        btn.BackgroundColor3 = Color3.fromRGB(45, 48, 65)
+        btn.BorderSizePixel = 0
+        btn.Font = Enum.Font.GothamBold
+        btn.Text = "OFF"
+        btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        btn.TextSize = 9
+        btn.AutoButtonColor = false
+        btn.Parent = traktorCard
+        Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+        return lbl, btn
     end
 
-    local slotsText = table.concat(TernakConfig.Slots, ",")
-    local SlotInput = makeInput("SlotInput", "Contoh: 1,2,3", slotsText, "SLOT KANDANG (PISAH KOMA):", 4)
-    local IntervalInput = makeInput("PakanIntervalInput", "Detik antar siklus", TernakConfig.Interval, "INTERVAL ISI (DETIK):", 46)
+    local function paintSwitch(btn, on)
+        local col = on and Color3.fromRGB(16, 185, 129) or Color3.fromRGB(45, 48, 65)
+        TweenService:Create(btn, TWEEN_FAST, { BackgroundColor3 = col }):Play()
+        btn.Text = on and "ON" or "OFF"
+    end
 
-    table.insert(Connections, SlotInput.FocusLost:Connect(function()
-        local slots = {}
-        for token in string.gmatch(SlotInput.Text, "%d+") do
-            local n = tonumber(token)
-            if n and n >= 1 then table.insert(slots, n) end
+    local spawnLbl, spawnBtn = makeSwitchRow(0, 0, "🚜 Spawn Traktor")
+    local driveLbl, driveBtn = makeSwitchRow(1, 0, "🚗 TP & Naik")
+    local routeLbl, routeBtn = makeSwitchRow(0, 1, "🛞 Setir Rute")
+    local dungLbl, dungBtn = makeSwitchRow(1, 1, "🔍 Deteksi Kotoran")
+
+    -- Pilihan kandang tujuan (bisa pilih lebih dari satu)
+    local prof1 = RouteConfig.Profiles[1]
+    for i, kName in ipairs(prof1.KandangNames) do
+        local kBtn = Instance.new("TextButton")
+        kBtn.Size = UDim2.new(0.25, -8, 0, 20)
+        kBtn.Position = UDim2.new((i - 1) * 0.25, 5, 0, 52)
+        kBtn.BorderSizePixel = 0
+        kBtn.Font = Enum.Font.GothamBold
+        kBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        kBtn.TextSize = 9
+        kBtn.AutoButtonColor = false
+        kBtn.Parent = traktorCard
+        Instance.new("UICorner", kBtn).CornerRadius = UDim.new(0, 6)
+
+        local function paintKandang()
+            local on = prof1.KandangSelected[i]
+            kBtn.BackgroundColor3 = on and Color3.fromRGB(16, 185, 129) or Color3.fromRGB(45, 48, 65)
+            kBtn.Text = (on and "✔ " or "") .. string.gsub(kName, "_", " ")
         end
-        if #slots > 0 then
-            TernakConfig.Slots = slots
-        end
-        SlotInput.Text = table.concat(TernakConfig.Slots, ",")
-    end))
+        paintKandang()
 
-    table.insert(Connections, IntervalInput.FocusLost:Connect(function()
-        local n = tonumber(IntervalInput.Text)
-        if n then
-            TernakConfig.Interval = math.clamp(n, 0.5, 600)
-        end
-        IntervalInput.Text = tostring(TernakConfig.Interval)
-    end))
-
-    local toggleBtn, toggleGrad = createHeroToggle(TernakPage, "ToggleTernakBtn", "▶  START AUTO ISI PAKAN", -44)
-
-    -- Tombol isi pakan manual (sekali tekan, tanpa harus mendekat)
-    local FEED_NOW_TEXT = "🍽️  ISI PAKAN SEKARANG (TANPA MENDEKAT)"
-    local feedBtn, feedGrad = createHeroToggle(TernakPage, "FeedNowBtn", FEED_NOW_TEXT, -92)
-    feedGrad.Color = ColorSequence.new({
-        ColorSequenceKeypoint.new(0, Color3.fromRGB(99, 102, 241)),
-        ColorSequenceKeypoint.new(1, Color3.fromRGB(59, 130, 246))
-    })
-
-    local feedBusy = false
-    table.insert(Connections, feedBtn.Activated:Connect(function()
-        if feedBusy then return end
-        feedBusy = true
-        task.spawn(function()
-            feedBtn.Text = "⏳  MENGISI PAKAN..."
-            local okCount, total = feedAllOnce()
-            onTernakUpdate()
-            if isScriptRunning then
-                feedBtn.Text = string.format("✔  SELESAI (%d/%d BERHASIL)", okCount, total)
-                task.wait(1.5)
-                feedBtn.Text = FEED_NOW_TEXT
+        table.insert(Connections, kBtn.Activated:Connect(function()
+            prof1.KandangSelected[i] = not prof1.KandangSelected[i]
+            paintKandang()
+            -- Hitung ulang segmen rute dengan pilihan baru (bila profil ini yang aktif)
+            if RouteState.Profile == 1 then
+                RouteState.KandangPos = nil
+                RouteState.Finished = false
+                RouteState.NeedInit = true
             end
-            feedBusy = false
-        end)
-    end))
-
-    onTernakUpdate = function()
-        sub.Text = string.format("Isi: %d | Skip: %d | Stok %s: %s",
-            TernakState.FillCount, TernakState.SkipCount,
-            TernakState.LastNama, TernakState.LastStok ~= nil and tostring(TernakState.LastStok) or "-")
+        end))
     end
 
-    table.insert(Connections, toggleBtn.Activated:Connect(function()
-        TernakState.Running = not TernakState.Running
+    H.cb.traktor = function()
+        spawnLbl.Text = string.format("🚜 Spawn Traktor (%dx)", TraktorState.SpawnCount)
+        driveLbl.Text = string.format("🚗 TP & Naik (%dx)", TraktorState.DriveCount)
+    end
 
-        if TernakState.Running then
-            toggleGrad.Color = ColorSequence.new({
-                ColorSequenceKeypoint.new(0, Color3.fromRGB(52, 211, 153)),
-                ColorSequenceKeypoint.new(1, Color3.fromRGB(16, 185, 129))
-            })
-            toggleBtn.Text = "■  STOP AUTO ISI PAKAN (RUNNING)"
-            badgeText.Text = "● ACTIVE"
-            badgeText.TextColor3 = Color3.fromRGB(52, 211, 153)
-            badge.BackgroundColor3 = Color3.fromRGB(20, 45, 35)
-            startTernakWorker()
+    H.cb.dung = function()
+        dungLbl.Text = string.format("🔍 Kotoran (%d | %dx)", DungState.Detected, DungState.Collected)
+    end
+
+    table.insert(Connections, dungBtn.Activated:Connect(function()
+        DungState.Running = not DungState.Running
+        paintSwitch(dungBtn, DungState.Running)
+        if DungState.Running then
+            startDungWorker()
         else
-            toggleGrad.Color = ColorSequence.new({
-                ColorSequenceKeypoint.new(0, Color3.fromRGB(244, 63, 94)),
-                ColorSequenceKeypoint.new(1, Color3.fromRGB(225, 29, 72))
-            })
-            toggleBtn.Text = "▶  START AUTO ISI PAKAN"
-            badgeText.Text = "● OFF"
-            badgeText.TextColor3 = Color3.fromRGB(160, 165, 185)
-            badge.BackgroundColor3 = Color3.fromRGB(30, 33, 46)
-            stopTernakWorker()
+            stopDungWorker()
         end
+    end))
+
+    table.insert(Connections, spawnBtn.Activated:Connect(function()
+        TraktorState.SpawnRunning = not TraktorState.SpawnRunning
+        paintSwitch(spawnBtn, TraktorState.SpawnRunning)
+        if TraktorState.SpawnRunning then
+            startTraktorSpawnWorker()
+        else
+            stopTraktorSpawnWorker()
+        end
+    end))
+
+    table.insert(Connections, driveBtn.Activated:Connect(function()
+        TraktorState.DriveRunning = not TraktorState.DriveRunning
+        paintSwitch(driveBtn, TraktorState.DriveRunning)
+        if TraktorState.DriveRunning then
+            startTraktorDriveWorker()
+        else
+            stopTraktorDriveWorker()
+        end
+    end))
+
+    -- Card: Masukkan kotoran ke mesin convert (hanya saat memakai traktor)
+    local convertCard = createModernCard(TernakPage, 30, 82)
+
+    local convertLbl = Instance.new("TextLabel")
+    convertLbl.Size = UDim2.new(1, -76, 1, 0)
+    convertLbl.Position = UDim2.new(0, 10, 0, 0)
+    convertLbl.BackgroundTransparency = 1
+    convertLbl.Font = Enum.Font.GothamBold
+    convertLbl.Text = "♻️ Masukkan ke Mesin Convert"
+    convertLbl.TextColor3 = Color3.fromRGB(230, 230, 245)
+    convertLbl.TextSize = 9
+    convertLbl.TextTruncate = Enum.TextTruncate.AtEnd
+    convertLbl.TextXAlignment = Enum.TextXAlignment.Left
+    convertLbl.Parent = convertCard
+
+    local convertBtn = Instance.new("TextButton")
+    convertBtn.Size = UDim2.new(0, 44, 0, 20)
+    convertBtn.Position = UDim2.new(1, -54, 0.5, -10)
+    convertBtn.BackgroundColor3 = Color3.fromRGB(45, 48, 65)
+    convertBtn.BorderSizePixel = 0
+    convertBtn.Font = Enum.Font.GothamBold
+    convertBtn.Text = "OFF"
+    convertBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    convertBtn.TextSize = 9
+    convertBtn.AutoButtonColor = false
+    convertBtn.Parent = convertCard
+    Instance.new("UICorner", convertBtn).CornerRadius = UDim.new(0, 6)
+
+    H.cb.convert = function()
+        convertLbl.Text = string.format("♻️ Masukkan ke Mesin Convert (%d ok | %d gagal)", ConvertState.Count, ConvertState.Fail)
+    end
+
+    table.insert(Connections, convertBtn.Activated:Connect(function()
+        ConvertState.Running = not ConvertState.Running
+        paintSwitch(convertBtn, ConvertState.Running)
+        if ConvertState.Running then
+            startConvertWorker()
+        else
+            stopConvertWorker()
+        end
+    end))
+
+    -- Card: Rute Plot 8 (Kandang_1 .. Kandang_8), terpisah dari rute awal
+    local plot8Card = createModernCard(TernakPage, 76, 118)
+    local prof2 = RouteConfig.Profiles[2]
+
+    local plot8Lbl = Instance.new("TextLabel")
+    plot8Lbl.Size = UDim2.new(1, -76, 0, 20)
+    plot8Lbl.Position = UDim2.new(0, 10, 0, 4)
+    plot8Lbl.BackgroundTransparency = 1
+    plot8Lbl.Font = Enum.Font.GothamBold
+    plot8Lbl.Text = "🛞 Rute Plot 8"
+    plot8Lbl.TextColor3 = Color3.fromRGB(230, 230, 245)
+    plot8Lbl.TextSize = 9
+    plot8Lbl.TextTruncate = Enum.TextTruncate.AtEnd
+    plot8Lbl.TextXAlignment = Enum.TextXAlignment.Left
+    plot8Lbl.Parent = plot8Card
+
+    local plot8Btn = Instance.new("TextButton")
+    plot8Btn.Size = UDim2.new(0, 44, 0, 20)
+    plot8Btn.Position = UDim2.new(1, -54, 0, 4)
+    plot8Btn.BackgroundColor3 = Color3.fromRGB(45, 48, 65)
+    plot8Btn.BorderSizePixel = 0
+    plot8Btn.Font = Enum.Font.GothamBold
+    plot8Btn.Text = "OFF"
+    plot8Btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    plot8Btn.TextSize = 9
+    plot8Btn.AutoButtonColor = false
+    plot8Btn.Parent = plot8Card
+    Instance.new("UICorner", plot8Btn).CornerRadius = UDim.new(0, 6)
+
+    -- Pilihan Kandang 1..8 (2 baris x 4 kolom)
+    for i, kName in ipairs(prof2.KandangNames) do
+        local col = (i - 1) % 4
+        local row = math.floor((i - 1) / 4)
+
+        local kBtn = Instance.new("TextButton")
+        kBtn.Size = UDim2.new(0.25, -8, 0, 20)
+        kBtn.Position = UDim2.new(col * 0.25, 5, 0, 28 + row * 24)
+        kBtn.BorderSizePixel = 0
+        kBtn.Font = Enum.Font.GothamBold
+        kBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        kBtn.TextSize = 9
+        kBtn.AutoButtonColor = false
+        kBtn.Parent = plot8Card
+        Instance.new("UICorner", kBtn).CornerRadius = UDim.new(0, 6)
+
+        local function paintKandang8()
+            local on = prof2.KandangSelected[i]
+            kBtn.BackgroundColor3 = on and Color3.fromRGB(16, 185, 129) or Color3.fromRGB(45, 48, 65)
+            kBtn.Text = (on and "✔ " or "") .. string.gsub(kName, "_", " ")
+        end
+        paintKandang8()
+
+        table.insert(Connections, kBtn.Activated:Connect(function()
+            prof2.KandangSelected[i] = not prof2.KandangSelected[i]
+            paintKandang8()
+            if RouteState.Profile == 2 then
+                RouteState.KandangPos = nil
+                RouteState.Finished = false
+                RouteState.NeedInit = true
+            end
+        end))
+    end
+
+    -- Label + tombol kedua rute mengikuti profil yang aktif (hanya satu yang bisa ON)
+    H.cb.route = function()
+        local active = RouteState.Running and RouteState.Profile or nil
+        routeLbl.Text = active == 1 and string.format("🛞 Setir Rute (%d putaran)", RouteState.Laps) or "🛞 Setir Rute"
+        plot8Lbl.Text = active == 2 and string.format("🛞 Rute Plot 8 (%d putaran)", RouteState.Laps) or "🛞 Rute Plot 8"
+    end
+
+    local function repaintRoutes()
+        local active = RouteState.Running and RouteState.Profile or nil
+        paintSwitch(routeBtn, active == 1)
+        paintSwitch(plot8Btn, active == 2)
+        H.cb.route()
+    end
+
+    table.insert(Connections, routeBtn.Activated:Connect(function()
+        toggleRouteProfile(1)
+        repaintRoutes()
+    end))
+
+    table.insert(Connections, plot8Btn.Activated:Connect(function()
+        toggleRouteProfile(2)
+        repaintRoutes()
     end))
 end
+buildTernakPage()
 
 -- ========================================================
 -- FOOTER BAR (CREDIT: SMITH GANTENG)
@@ -2736,7 +3559,7 @@ local function shutdown()
     pcall(stopTenantWorker)
     pcall(stopSpinWatcher)
     pcall(stopAntiAfk)
-    pcall(stopTernakWorker)
+    pcall(TernakHub.stopAll)
 
     for _, conn in ipairs(Connections) do
         if conn and conn.Disconnect then pcall(function() conn:Disconnect() end) end
