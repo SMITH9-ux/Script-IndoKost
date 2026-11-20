@@ -1225,7 +1225,8 @@ local TernakHub = (function()
         traktor = function() end,
         dung = function() end,
         route = function() end,
-        convert = function() end
+        convert = function() end,
+        pakan = function() end
     }
     local RunService = game:GetService("RunService")
 
@@ -1315,6 +1316,13 @@ local TernakHub = (function()
                 -- Bila nama Kandang_N sama di beberapa plot: utamakan yang berada di bawah objek
                 -- bernama mengandung kata kunci ini (huruf kecil). Hanya preferensi, bukan syarat.
                 PlotKeywords = { "plot 8", "plot_8", "plot8" }
+            },
+            { -- 3: Rute Pakan, palung_1 -> palung_2 (kasih pakan saat tiba di tiap palung)
+                Name = "Pakan",
+                KandangNames = { "palung_1", "palung_2" },
+                KandangSelected = { true, true },
+                PlotKeywords = {},
+                FeedArgs = { 1, 2 } -- argumen IsiPakan untuk tiap tujuan (palung_1 -> 1, palung_2 -> 2)
             }
         },
         Speed = 25,             -- studs/detik
@@ -1519,6 +1527,103 @@ local TernakHub = (function()
         end
     end
 
+
+    -- ========================================================
+    -- AUTO KASIH PAKAN (TernakService.IsiPakan)
+    -- Dipakai tombol Auto Kasih Pakan (berkala) dan Rute Pakan (saat tiba di palung)
+    -- ========================================================
+    local PakanConfig = {
+        Slots = { 1, 2 },        -- argumen IsiPakan untuk tombol Auto Kasih Pakan (berkala)
+        Interval = 5,            -- detik antar siklus (berkala)
+        CallDelay = 0.3,         -- detik antar pemanggilan IsiPakan
+        CallsPerStop = 1         -- jumlah IsiPakan tiap kali tiba di palung (Rute Pakan)
+    }
+
+    local PakanState = {
+        Running = false,
+        Fill = 0,                -- pemanggilan yang berhasil (ok = true)
+        Skip = 0,                -- ditolak server (mis. pakan penuh / stok habis)
+        LastStok = nil,
+        LastNama = "-",
+        Busy = false
+    }
+
+    local pakanThread = nil
+    local pakanRF = nil
+
+    local function getPakanRemote()
+        if pakanRF and pakanRF.Parent then return pakanRF end
+        pcall(function()
+            pakanRF = ReplicatedStorage
+                :WaitForChild("NKSystem", 5)
+                :WaitForChild("Packages", 5)
+                :WaitForChild("Knit", 5)
+                :WaitForChild("Services", 5)
+                :WaitForChild("TernakService", 5)
+                :WaitForChild("RF", 5)
+                :WaitForChild("IsiPakan", 5)
+        end)
+        return pakanRF
+    end
+
+    -- IsiPakan:InvokeServer(slot). Return true bila server menjawab ok = true
+    local function feedSlot(slot)
+        if PakanState.Busy then return false end
+        local rf = getPakanRemote()
+        if not rf then
+            warn("[Pakan] Remote TernakService.IsiPakan tidak ditemukan")
+            return false
+        end
+
+        PakanState.Busy = true
+        local okCall, result = pcall(function()
+            return rf:InvokeServer(slot)
+        end)
+        PakanState.Busy = false
+
+        if okCall and type(result) == "table" and result.ok then
+            PakanState.Fill += 1
+            PakanState.LastStok = result.stok
+            PakanState.LastNama = tostring(result.nama or "-")
+            print(string.format("[Pakan] IsiPakan(%s) OK | %s stok: %s | jumlah: %s",
+                tostring(slot), PakanState.LastNama, tostring(result.stok), tostring(result.jumlah)))
+            cb.pakan()
+            return true
+        end
+
+        PakanState.Skip += 1
+        warn(string.format("[Pakan] IsiPakan(%s) gagal/ditolak server", tostring(slot)))
+        if not okCall then
+            warn("[Pakan Error]:", result)
+        elseif type(result) == "table" and result.stok ~= nil then
+            PakanState.LastStok = result.stok
+        end
+        cb.pakan()
+        return false
+    end
+
+    local function startPakanWorker()
+        if pakanThread then return end
+        pakanThread = task.spawn(function()
+            while PakanState.Running and isScriptRunning do
+                for _, slot in ipairs(PakanConfig.Slots) do
+                    if not (PakanState.Running and isScriptRunning) then break end
+                    feedSlot(slot)
+                    task.wait(PakanConfig.CallDelay)
+                end
+                task.wait(PakanConfig.Interval)
+            end
+            pakanThread = nil
+        end)
+    end
+
+    local function stopPakanWorker()
+        PakanState.Running = false
+        if pakanThread then
+            task.cancel(pakanThread)
+            pakanThread = nil
+        end
+    end
 
     -- ========================================================
     -- MASUKKAN KOTORAN KE MESIN CONVERT (ConvertService.Masukkan)
@@ -1984,6 +2089,19 @@ local TernakHub = (function()
 
         local dt = RunService.Heartbeat:Wait()
         if stepToward(model, dt, RouteState.KandangPos, RouteConfig.ArriveDistance) then
+            -- Rute Pakan: kasih pakan di tujuan ini (palung_1 -> IsiPakan(1), palung_2 -> IsiPakan(2))
+            local prof = RouteConfig.Profiles[RouteState.Profile]
+            if prof and prof.FeedArgs then
+                for i, nm in ipairs(prof.KandangNames) do
+                    if nm == name and prof.FeedArgs[i] ~= nil then
+                        for _ = 1, PakanConfig.CallsPerStop do
+                            feedSlot(prof.FeedArgs[i])
+                            task.wait(PakanConfig.CallDelay)
+                        end
+                        break
+                    end
+                end
+            end
             task.wait(RouteConfig.DwellTime)
             RouteState.KandangPos = nil
             RouteState.KIndex += 1
@@ -2073,6 +2191,8 @@ local TernakHub = (function()
 
     return {
         cb = cb,
+        PakanConfig = PakanConfig, PakanState = PakanState,
+        startPakanWorker = startPakanWorker, stopPakanWorker = stopPakanWorker,
         ConvertState = ConvertState,
         startConvertWorker = startConvertWorker, stopConvertWorker = stopConvertWorker,
         TraktorState = TraktorState,
@@ -2087,6 +2207,7 @@ local TernakHub = (function()
             pcall(stopTraktorSpawnWorker)
             pcall(stopTraktorDriveWorker)
             pcall(stopConvertWorker)
+            pcall(stopPakanWorker)
             pcall(stopDungWorker)
             pcall(stopRouteWorker)
         end
@@ -3263,6 +3384,7 @@ local function buildTernakPage()
     local RouteConfig, RouteState = H.RouteConfig, H.RouteState
     local startRouteWorker, stopRouteWorker = H.startRouteWorker, H.stopRouteWorker
     local toggleRouteProfile = H.toggleRouteProfile
+    local PakanState, startPakanWorker, stopPakanWorker = H.PakanState, H.startPakanWorker, H.stopPakanWorker
 
     -- Card: tombol terpisah Auto Spawn Traktor & Auto Mengemudi
     local traktorCard = createModernCard(TernakPage, 76, 0)
@@ -3486,17 +3608,121 @@ local function buildTernakPage()
         end))
     end
 
-    -- Label + tombol kedua rute mengikuti profil yang aktif (hanya satu yang bisa ON)
+    -- Card: Rute Pakan (palung_1 -> palung_2): traktor ke tempat pakan lalu kasih pakan
+    local pakanCard = createModernCard(TernakPage, 54, 200)
+    local profPakan = RouteConfig.Profiles[3]
+
+    local pakanRouteLbl = Instance.new("TextLabel")
+    pakanRouteLbl.Size = UDim2.new(1, -76, 0, 20)
+    pakanRouteLbl.Position = UDim2.new(0, 10, 0, 4)
+    pakanRouteLbl.BackgroundTransparency = 1
+    pakanRouteLbl.Font = Enum.Font.GothamBold
+    pakanRouteLbl.Text = "🌾 Rute Pakan (palung_1 → palung_2)"
+    pakanRouteLbl.TextColor3 = Color3.fromRGB(230, 230, 245)
+    pakanRouteLbl.TextSize = 9
+    pakanRouteLbl.TextTruncate = Enum.TextTruncate.AtEnd
+    pakanRouteLbl.TextXAlignment = Enum.TextXAlignment.Left
+    pakanRouteLbl.Parent = pakanCard
+
+    local pakanRouteBtn = Instance.new("TextButton")
+    pakanRouteBtn.Size = UDim2.new(0, 44, 0, 20)
+    pakanRouteBtn.Position = UDim2.new(1, -54, 0, 4)
+    pakanRouteBtn.BackgroundColor3 = Color3.fromRGB(45, 48, 65)
+    pakanRouteBtn.BorderSizePixel = 0
+    pakanRouteBtn.Font = Enum.Font.GothamBold
+    pakanRouteBtn.Text = "OFF"
+    pakanRouteBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    pakanRouteBtn.TextSize = 9
+    pakanRouteBtn.AutoButtonColor = false
+    pakanRouteBtn.Parent = pakanCard
+    Instance.new("UICorner", pakanRouteBtn).CornerRadius = UDim.new(0, 6)
+
+    -- Pilihan palung 1 / palung 2
+    for i, kName in ipairs(profPakan.KandangNames) do
+        local kBtn = Instance.new("TextButton")
+        kBtn.Size = UDim2.new(0.5, -8, 0, 20)
+        kBtn.Position = UDim2.new((i - 1) * 0.5, 5, 0, 28)
+        kBtn.BorderSizePixel = 0
+        kBtn.Font = Enum.Font.GothamBold
+        kBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        kBtn.TextSize = 9
+        kBtn.AutoButtonColor = false
+        kBtn.Parent = pakanCard
+        Instance.new("UICorner", kBtn).CornerRadius = UDim.new(0, 6)
+
+        local function paintPalung()
+            local on = profPakan.KandangSelected[i]
+            kBtn.BackgroundColor3 = on and Color3.fromRGB(16, 185, 129) or Color3.fromRGB(45, 48, 65)
+            kBtn.Text = (on and "✔ " or "") .. string.gsub(kName, "_", " ")
+        end
+        paintPalung()
+
+        table.insert(Connections, kBtn.Activated:Connect(function()
+            profPakan.KandangSelected[i] = not profPakan.KandangSelected[i]
+            paintPalung()
+            if RouteState.Profile == 3 then
+                RouteState.KandangPos = nil
+                RouteState.Finished = false
+                RouteState.NeedInit = true
+            end
+        end))
+    end
+
+    -- Card: Auto Kasih Pakan berkala (IsiPakan(1) lalu IsiPakan(2), tanpa pindah posisi)
+    local feedCard = createModernCard(TernakPage, 30, 260)
+
+    local feedLbl = Instance.new("TextLabel")
+    feedLbl.Size = UDim2.new(1, -76, 1, 0)
+    feedLbl.Position = UDim2.new(0, 10, 0, 0)
+    feedLbl.BackgroundTransparency = 1
+    feedLbl.Font = Enum.Font.GothamBold
+    feedLbl.Text = "🌾 Auto Kasih Pakan (berkala)"
+    feedLbl.TextColor3 = Color3.fromRGB(230, 230, 245)
+    feedLbl.TextSize = 9
+    feedLbl.TextTruncate = Enum.TextTruncate.AtEnd
+    feedLbl.TextXAlignment = Enum.TextXAlignment.Left
+    feedLbl.Parent = feedCard
+
+    local feedBtn = Instance.new("TextButton")
+    feedBtn.Size = UDim2.new(0, 44, 0, 20)
+    feedBtn.Position = UDim2.new(1, -54, 0.5, -10)
+    feedBtn.BackgroundColor3 = Color3.fromRGB(45, 48, 65)
+    feedBtn.BorderSizePixel = 0
+    feedBtn.Font = Enum.Font.GothamBold
+    feedBtn.Text = "OFF"
+    feedBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    feedBtn.TextSize = 9
+    feedBtn.AutoButtonColor = false
+    feedBtn.Parent = feedCard
+    Instance.new("UICorner", feedBtn).CornerRadius = UDim.new(0, 6)
+
+    H.cb.pakan = function()
+        feedLbl.Text = string.format("🌾 Auto Kasih Pakan (%d ok | %d skip)", PakanState.Fill, PakanState.Skip)
+    end
+
+    table.insert(Connections, feedBtn.Activated:Connect(function()
+        PakanState.Running = not PakanState.Running
+        paintSwitch(feedBtn, PakanState.Running)
+        if PakanState.Running then
+            startPakanWorker()
+        else
+            stopPakanWorker()
+        end
+    end))
+
+    -- Label + tombol ketiga rute mengikuti profil yang aktif (hanya satu yang bisa ON)
     H.cb.route = function()
         local active = RouteState.Running and RouteState.Profile or nil
         routeLbl.Text = active == 1 and string.format("🛞 Setir Rute (%d putaran)", RouteState.Laps) or "🛞 Setir Rute"
         plot8Lbl.Text = active == 2 and string.format("🛞 Rute Plot 8 (%d putaran)", RouteState.Laps) or "🛞 Rute Plot 8"
+        pakanRouteLbl.Text = active == 3 and string.format("🌾 Rute Pakan (%d putaran)", RouteState.Laps) or "🌾 Rute Pakan (palung_1 → palung_2)"
     end
 
     local function repaintRoutes()
         local active = RouteState.Running and RouteState.Profile or nil
         paintSwitch(routeBtn, active == 1)
         paintSwitch(plot8Btn, active == 2)
+        paintSwitch(pakanRouteBtn, active == 3)
         H.cb.route()
     end
 
@@ -3507,6 +3733,11 @@ local function buildTernakPage()
 
     table.insert(Connections, plot8Btn.Activated:Connect(function()
         toggleRouteProfile(2)
+        repaintRoutes()
+    end))
+
+    table.insert(Connections, pakanRouteBtn.Activated:Connect(function()
+        toggleRouteProfile(3)
         repaintRoutes()
     end))
 end
